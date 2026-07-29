@@ -117,7 +117,7 @@ journalctl --user -u letsnote-wheelpad -f
 
 - **`WheelUnderCursor` は設定不可。** Wayland ではコンポジタがフォーカス先サーフェスにイベントを配るため、ユーザランドからの上書きはできません。
 - **縦方向の円スクロールは Synaptics TM3562-3 と CF-SZ6 SYN0502 で実機検証済み。** 他のタッチパッドでも `device_name_regex` と座標補正を設定すれば動く可能性はありますが、動作保証はしません。
-- **入力プロキシの復旧処理はまだ実機検証していません。** contactまたはbuttonがactiveな起動時の待機・grab retry、signal shutdown、`SYN_DROPPED` 復旧、ボタンを押したままのスクロールは、物理タッチパッド・uinput・libinput を通した end-to-end 試験が必要です。
+- **入力プロキシ復旧処理のhands-on検証はまだ完了していません。** 物理touchpadとuinputを使ったidle startupおよびSIGTERM shutdownは確認しましたが、起動時の操作、実際のtouch lifecycle、`SYN_DROPPED`復旧、ボタンを押したままのscrollingは、libinputまで通したend-to-end試験が必要です。
 - **Excel 用矢印キーフォールバックは削除。** 現代の Excel は横ホイールイベントをネイティブで処理するため、Windows 版のハックは不要です。
 - **コースティング/慣性スクロールなし。** Windows 版 WheelPad に合わせています。xf86 にはありますが、本プロジェクトでは実装しません。
 
@@ -127,7 +127,9 @@ journalctl --user -u letsnote-wheelpad -f
 
 物理evdev FDはopen直後に、既存file-status flagsを保持したままnonblockingへ変更します。起動時には物理deviceをungrabbedのまま仮想deviceを作成し、ungrabbed queueですでに利用可能なeventだけをdrainして`EAGAIN`で正常停止した後、現在stateを照会します。MT tracking ID、`BTN_TOUCH`、物理touchpad buttonのいずれかがactiveなら、既存consumerがそのlifecycleを完了できるよう待機します。
 
-quiescenceを確認した後にgrabし、post-grab eventを読んだり捨てたりせず、直ちにkernel stateを再照会します。observation/grab raceでinputがactiveになっていれば、exclusive queueのeventをconsumeせずungrabし、再びquiescenceを待ちます。再照会もquiescentなら、post-grab eventは通常proxy処理用にqueueへ残します。systemdへ`READY=1`を送る前に、確認した物理current MT slotを仮想touchpadでも選択し、同じsnapshotからgesture/Router stateを初期化します。恒久grab前からactiveだったlifecycleをproxyへ途中から引き継ぐことはしません。
+quiescenceを確認した後にgrabし、post-grab eventを読んだり捨てたりせず、直ちにkernel stateを再照会します。再照会もquiescentなら、post-grab eventは通常proxy処理用にqueueへ残します。systemdへ`READY=1`を送る前に、確認した物理current MT slotを仮想touchpadでも選択し、同じsnapshotからgesture/Router stateを初期化します。恒久grab前からactiveだったlifecycleをproxyへ途中から引き継ぐことはしません。
+
+この再照会はownership transitionのraceを縮小しますが、完全には解消しません。`EVIOCGRAB`が有効になった後、state照会より前にtouchまたはbutton pressが始まる可能性があります。再照会がそのinputを検出した場合、daemonはqueued eventをconsumeせずungrabしてquiescenceを待ちます。しかしkernelはgrabberだけへ配信したtouch-downまたはpressを既存evdev clientへreplayしません。そのため進行中のcontactは、ユーザーが完全にliftするまで無視されるか、不完全に見える可能性があります。daemonはその後の新しい完全なlifecycleを正常に処理できなければなりません。このgapを完全に除去するには、libinputが物理deviceを恒久的に無視し、仮想proxyだけをconsumeするarchitectureが必要です。
 
 evdev streamはraw modeで読み、`SYN_DROPPED`を検出したら全slotのtracking IDと位置を再取得します。再構築streamは、変化したまたはactiveな各slotを選択し、必要なtracking終了/開始eventを出し、identityが変わっていないactive slotを含めて最新X/Yを出し、最後に物理deviceのrefreshed current slotを再選択して`SYN_REPORT`を出します。Scrolling中の捕捉contact X/Yはroutingで抑止できますが、非捕捉contactの再構築位置は転送します。ただし、`SYN_DROPPED`後にすべての補助key/ABS stateを仮想device上へ完全再構築する処理は未実装です。
 

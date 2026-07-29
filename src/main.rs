@@ -92,8 +92,10 @@ fn run(args: Args) -> Result<()> {
     // 4. Do not cut an active physical lifecycle away from its current
     //    consumers. Wait ungrabbed until all contacts and touchpad
     //    buttons are released, then grab and immediately re-query to
-    //    close the observation/grab race. If input became active in
-    //    that window, release the grab and retry.
+    //    reduce the observation/grab race. If input became active in
+    //    that window, release the grab and retry. The kernel does not
+    //    replay an exclusively delivered touch-down to existing clients,
+    //    so that narrow ownership-transition race remains documented.
     let mut startup = StartupCoordinator::default();
     let mut ungrabbed = input;
     // Discard only events already queued while the physical lifecycle
