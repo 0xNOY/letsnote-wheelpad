@@ -67,7 +67,7 @@ sensitivity          = 0      # -2..+2 ; 小さいほど低感度
 detect_area_width    = 0      # 0..10 ; 0=外周のみ, 10=全面
 detect_area_radius   = 200.0  # width=0 時の内半径（X軸の座標単位）
 coordinate_y_scale   = 1.0    # Yに掛ける倍率。X範囲 / Y範囲を指定
-minimum_rotation_radius = 100.0 # 小さな円運動を除外。0で無効
+minimum_rotation_radius = 250.0 # 小さな円運動を除外。0で無効
 horizontal_start     = 2      # 円弧開始位置 (π/8 単位 ; 2 → 45°)
 horizontal_end       = 6      # 円弧終了位置 (π/8 単位 ; 6 → 135°)
 
@@ -85,7 +85,7 @@ level = "info"  # trace | debug | info | warn | error
 | `scroll.detect_area_width` | `0` | 0..10 | `0`=外周のみ、`10`=全面でスクロール開始可能。 |
 | `scroll.detect_area_radius` | `200.0` | > 0 | `width=0` 時の内側デッドゾーン半径（X軸の生座標単位）。反応領域が広すぎる場合は大きくする。 |
 | `scroll.coordinate_y_scale` | `1.0` | > 0 | すべてのY方向距離に掛ける補正値。円形パッドの座標密度が縦横で異なる場合は `Xの範囲 / Yの範囲` を指定。 |
-| `scroll.minimum_rotation_radius` | `100.0` | ≥ 0 | 補正後のX軸座標単位で指定する局所的な円の最小半径。これより小さい円運動を無視し、`0`で無効。 |
+| `scroll.minimum_rotation_radius` | `250.0` | ≥ 0 | 補正後のX軸座標単位で指定する局所的な円の最小半径。これより小さい円運動を無視し、`0`で無効。 |
 | `scroll.horizontal_start` | `2` | 0..15 | π/8 単位。45°→135° のデフォルトはパッド下端。 |
 | `scroll.horizontal_end` | `6` | 0..15 | |
 

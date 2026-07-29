@@ -61,7 +61,7 @@ impl Default for Scroll {
             detect_area_width: 0,
             detect_area_radius: 200.0,
             coordinate_y_scale: 1.0,
-            minimum_rotation_radius: 100.0,
+            minimum_rotation_radius: 250.0,
             horizontal_start: 2,
             horizontal_end: 6,
         }
@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(c.scroll.detect_area_width, 0);
         assert_eq!(c.scroll.detect_area_radius, 200.0);
         assert_eq!(c.scroll.coordinate_y_scale, 1.0);
-        assert_eq!(c.scroll.minimum_rotation_radius, 100.0);
+        assert_eq!(c.scroll.minimum_rotation_radius, 250.0);
         assert_eq!(c.scroll.horizontal_start, 2);
         assert_eq!(c.scroll.horizontal_end, 6);
     }
@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(c.scroll.horizontal_start, 2);
         assert_eq!(c.scroll.detect_area_radius, 200.0);
         assert_eq!(c.scroll.coordinate_y_scale, 1.0);
-        assert_eq!(c.scroll.minimum_rotation_radius, 100.0);
+        assert_eq!(c.scroll.minimum_rotation_radius, 250.0);
     }
 
     #[test]
