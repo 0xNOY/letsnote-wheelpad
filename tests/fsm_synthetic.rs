@@ -4,7 +4,12 @@ use std::f64::consts::PI;
 
 use letsnote_wheelpad::config::Scroll;
 use letsnote_wheelpad::detector::{CircularDetector, CoordinateTransform, TouchSample};
-use letsnote_wheelpad::fsm::{Action, Fsm, FsmState, TouchFrame};
+use letsnote_wheelpad::fsm::{Action, ContactId, Fsm, FsmState, TouchFrame};
+
+const CONTACT_A: ContactId = ContactId {
+    slot: 1,
+    tracking_id: 42,
+};
 
 fn default_scroll() -> Scroll {
     Scroll::default()
@@ -14,6 +19,7 @@ fn lift() -> TouchFrame {
     TouchFrame {
         contact: false,
         pos: None,
+        contact_id: Some(CONTACT_A),
     }
 }
 
@@ -21,6 +27,7 @@ fn touch(x: i32, y: i32) -> TouchFrame {
     TouchFrame {
         contact: true,
         pos: Some(TouchSample { x, y }),
+        contact_id: Some(CONTACT_A),
     }
 }
 
@@ -145,7 +152,7 @@ fn moving_to_scrolling_on_swept_angle_past_trigger() {
     let end = touch(end_x, end_y);
 
     drive(&mut fsm, &mut det, &scroll, &[start, end]);
-    assert!(matches!(fsm.state(), FsmState::Scrolling));
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
 }
 
 #[test]
@@ -184,7 +191,7 @@ fn anisotropic_coordinates_preserve_engagement_threshold_around_both_axes() {
 
         drive(&mut fsm, &mut detector, &scroll, &[above]);
         assert!(
-            matches!(fsm.state(), FsmState::Scrolling),
+            matches!(fsm.state(), FsmState::Scrolling { .. }),
             "16° should cross the trigger near angle {start_angle}"
         );
     }
@@ -243,10 +250,71 @@ fn scrolling_to_debounce_on_lift() {
     let mid = touch(mid_x, mid_y);
 
     drive(&mut fsm, &mut det, &scroll, &[start, mid]);
-    assert!(matches!(fsm.state(), FsmState::Scrolling));
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
 
     drive(&mut fsm, &mut det, &scroll, &[lift()]);
     assert!(matches!(fsm.state(), FsmState::Debounce));
+}
+
+#[test]
+fn scrolling_survives_stationary_frames_and_resumes_ticks() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+    let samples = (0..=80)
+        .map(|i| {
+            let theta = 2.0 * PI * i as f64 / 80.0;
+            touch(
+                500 + (300.0 * theta.cos()).round() as i32,
+                500 + (300.0 * theta.sin()).round() as i32,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let engagement = drive(&mut fsm, &mut det, &scroll, &samples[..6]);
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+
+    let stationary = samples[5];
+    let paused = drive(&mut fsm, &mut det, &scroll, &[stationary; 32]);
+    assert!(paused.is_empty());
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+
+    let resumed = drive(&mut fsm, &mut det, &scroll, &samples[6..]);
+    assert!(
+        engagement
+            .into_iter()
+            .chain(resumed)
+            .any(|action| !matches!(action, Action::None)),
+        "the same contact must emit wheel ticks after resuming"
+    );
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+}
+
+#[test]
+fn scrolling_retains_the_engaging_contact_identity() {
+    let mut fsm = Fsm::new(500, 500);
+    let mut det = CircularDetector::new();
+    let scroll = default_scroll();
+    let theta = PI / 8.0;
+
+    drive(
+        &mut fsm,
+        &mut det,
+        &scroll,
+        &[
+            touch(800, 500),
+            touch(
+                500 + (300.0 * theta.cos()).round() as i32,
+                500 + (300.0 * theta.sin()).round() as i32,
+            ),
+        ],
+    );
+
+    assert_eq!(fsm.contact_id(), Some(CONTACT_A));
+    assert!(matches!(
+        fsm.state(),
+        FsmState::Scrolling { contact: CONTACT_A }
+    ));
 }
 
 #[test]
@@ -264,7 +332,7 @@ fn force_idle_resets_state() {
         500 + (220.0 * theta.sin()).round() as i32,
     );
     drive(&mut fsm, &mut det, &scroll, &[start, mid]);
-    assert!(matches!(fsm.state(), FsmState::Scrolling));
+    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
 
     fsm.force_idle(&mut det);
     assert!(matches!(fsm.state(), FsmState::Idle));

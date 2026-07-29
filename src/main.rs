@@ -1,7 +1,6 @@
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
 use clap::Parser;
 use nix::poll::{poll, PollFd, PollFlags};
@@ -14,11 +13,6 @@ use letsnote_wheelpad::error::{Error, Result};
 use letsnote_wheelpad::evdev::InputDevice;
 use letsnote_wheelpad::fsm::{Action, Fsm, FsmState};
 use letsnote_wheelpad::uinput::{UinputTouchpad, UinputWheel};
-
-/// 5 second watchdog — if the FSM has been Scrolling without consuming a
-/// packet for this long, force back to Idle so passthrough resumes and
-/// the cursor unfreezes. linux-design §14 risk 13.
-const SCROLLING_WATCHDOG: Duration = Duration::from_secs(5);
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -114,24 +108,14 @@ fn run(args: Args) -> Result<()> {
 
     // 8. Main loop.
     let raw_fd = input.device.as_raw_fd();
-    let mut last_packet_at = Instant::now();
 
     while !STOP.load(Ordering::Relaxed) {
-        // While scrolling, cap the wait so the watchdog can fire when
-        // packet flow truly stalls (not when a long deliberate scroll
-        // is in progress — last_packet_at is reset on every frame).
-        let timeout_ms: i32 = if matches!(fsm.state(), FsmState::Scrolling) {
-            let remaining = SCROLLING_WATCHDOG.saturating_sub(last_packet_at.elapsed());
-            remaining.as_millis() as i32
-        } else {
-            -1
-        };
         // SAFETY: raw_fd is owned by `input.device` which outlives the
         // borrow for the iteration; we never read/write through the
         // BorrowedFd ourselves.
         let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
         let mut fds = [PollFd::new(&borrowed, PollFlags::POLLIN)];
-        let n = match poll(&mut fds, timeout_ms) {
+        let _ready = match poll(&mut fds, -1) {
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => {
@@ -139,18 +123,6 @@ fn run(args: Args) -> Result<()> {
                 break;
             }
         };
-
-        if n == 0 {
-            // Timeout. Watchdog fires only if we've been stuck in
-            // Scrolling without any packet for the full window.
-            if matches!(fsm.state(), FsmState::Scrolling)
-                && last_packet_at.elapsed() >= SCROLLING_WATCHDOG
-            {
-                warn!("scrolling watchdog fired — forcing idle, resuming passthrough");
-                fsm.force_idle(&mut detector);
-            }
-            continue;
-        }
 
         let frames = match input.poll_frames() {
             Ok(fs) => fs,
@@ -168,16 +140,17 @@ fn run(args: Args) -> Result<()> {
             continue;
         }
 
-        // Got at least one packet; reset the watchdog.
-        last_packet_at = Instant::now();
-
         for pf in frames {
             // Snapshot pre-step state. The forwarding decision uses
             // BOTH pre and post: pre tells us whether positions need
             // stripping (lift batch), post tells us whether to forward
             // at all (suppress during Scrolling).
             let prev_state = fsm.state();
-            let action = fsm.step(pf.frame, &mut detector, &config.scroll);
+            let frame = match fsm.contact_id() {
+                Some(contact) => pf.contacts.for_contact(contact),
+                None => pf.contacts.primary(),
+            };
+            let action = fsm.step(frame, &mut detector, &config.scroll);
             let now_state = fsm.state();
 
             match action {
@@ -204,8 +177,8 @@ fn run(args: Args) -> Result<()> {
             //          synthetic jump from the pre-engagement
             //          coordinate.
             //   otherwise → forward verbatim.
-            if !matches!(now_state, FsmState::Scrolling) {
-                let strip_positions = matches!(prev_state, FsmState::Scrolling);
+            if !matches!(now_state, FsmState::Scrolling { .. }) {
+                let strip_positions = matches!(prev_state, FsmState::Scrolling { .. });
                 if let Err(e) = vtouchpad.forward(&pf.events, strip_positions) {
                     warn!("virtual touchpad forward failed: {e}");
                 }
