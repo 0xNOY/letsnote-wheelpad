@@ -73,6 +73,24 @@ pub enum Error {
 
     #[error("signal handling setup failed: {source}")]
     Signal { source: nix::errno::Errno },
+
+    #[error("XDG runtime directory is unavailable for the instance lock: {reason}")]
+    RuntimeDirUnavailable { reason: String },
+
+    #[error("failed to identify physical device {path:?} for locking: {source}")]
+    DeviceIdentity { path: PathBuf, source: io::Error },
+
+    #[error("failed to open instance lock {path:?}: {source}")]
+    InstanceLockOpen { path: PathBuf, source: io::Error },
+
+    #[error("another letsnote-wheelpad instance already owns {device:?} (lock {lock_path:?})")]
+    InstanceAlreadyRunning { device: PathBuf, lock_path: PathBuf },
+
+    #[error("failed to lock {path:?}: {source}")]
+    InstanceLock {
+        path: PathBuf,
+        source: nix::errno::Errno,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

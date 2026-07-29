@@ -13,7 +13,7 @@ use letsnote_wheelpad::error::{Error, Result};
 use letsnote_wheelpad::evdev::{GrabGuard, InputDevice};
 use letsnote_wheelpad::fsm::{Action, Fsm, FsmState};
 use letsnote_wheelpad::router::{Router, RoutingMode};
-use letsnote_wheelpad::runtime::LoopExit;
+use letsnote_wheelpad::runtime::{InstanceLock, LoopExit};
 use letsnote_wheelpad::uinput::{UinputTouchpad, UinputWheel};
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -61,6 +61,8 @@ fn run(args: Args) -> Result<()> {
         Some(p) => p,
         None => InputDevice::find_by_name(&config.device_name_regex)?,
     };
+    let instance_lock = InstanceLock::acquire(&device_path)?;
+    debug!(path = %instance_lock.path().display(), "instance lock acquired");
     info!(path = %device_path.display(), "opening touchpad");
     let input = InputDevice::open(&device_path)?;
     info!(
