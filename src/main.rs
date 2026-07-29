@@ -4,14 +4,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
 use nix::poll::{poll, PollFd, PollFlags};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use letsnote_wheelpad::config::Config;
 use letsnote_wheelpad::detector::{CircularDetector, CoordinateTransform};
 use letsnote_wheelpad::error::{Error, Result};
-use letsnote_wheelpad::evdev::InputDevice;
+use letsnote_wheelpad::evdev::{GrabGuard, InputDevice};
 use letsnote_wheelpad::fsm::{Action, Fsm, FsmState};
+use letsnote_wheelpad::runtime::LoopExit;
 use letsnote_wheelpad::uinput::{UinputTouchpad, UinputWheel};
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -60,7 +61,7 @@ fn run(args: Args) -> Result<()> {
         None => InputDevice::find_by_name(&config.device_name_regex)?,
     };
     info!(path = %device_path.display(), "opening touchpad");
-    let mut input = InputDevice::open(&device_path)?;
+    let input = InputDevice::open(&device_path)?;
     info!(
         x_range = %format!("[{}, {}]", input.abs_x_min, input.abs_x_max),
         y_range = %format!("[{}, {}]", input.abs_y_min, input.abs_y_max),
@@ -85,10 +86,7 @@ fn run(args: Args) -> Result<()> {
     //    through our virtual touchpad. Releasing the grab is handled
     //    by `Drop` on `input.device` (and by the panic-safety cleanup
     //    after the main loop returns).
-    input
-        .device
-        .grab()
-        .map_err(|source| Error::Grab { source })?;
+    let mut input = input.grab()?;
     info!("physical touchpad grabbed (passthrough mode)");
 
     // 5. Notify systemd we're ready.
@@ -107,9 +105,35 @@ fn run(args: Args) -> Result<()> {
     install_signal_handlers()?;
 
     // 8. Main loop.
-    let raw_fd = input.device.as_raw_fd();
+    let exit = run_event_loop(
+        &mut input,
+        &mut vtouchpad,
+        &mut vwheel,
+        &mut fsm,
+        &mut detector,
+        &config,
+    );
+    info!(reason = %exit, "input loop stopped");
+    if exit.is_success() {
+        Ok(())
+    } else {
+        Err(Error::Runtime { source: exit })
+    }
+}
 
-    while !STOP.load(Ordering::Relaxed) {
+fn run_event_loop(
+    input: &mut GrabGuard,
+    vtouchpad: &mut UinputTouchpad,
+    vwheel: &mut UinputWheel,
+    fsm: &mut Fsm,
+    detector: &mut CircularDetector,
+    config: &Config,
+) -> LoopExit {
+    let raw_fd = input.device.as_raw_fd();
+    loop {
+        if STOP.load(Ordering::Relaxed) {
+            return LoopExit::RequestedShutdown;
+        }
         // SAFETY: raw_fd is owned by `input.device` which outlives the
         // borrow for the iteration; we never read/write through the
         // BorrowedFd ourselves.
@@ -117,22 +141,31 @@ fn run(args: Args) -> Result<()> {
         let mut fds = [PollFd::new(&borrowed, PollFlags::POLLIN)];
         let _ready = match poll(&mut fds, -1) {
             Ok(n) => n,
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => {
-                error!("poll error: {e}");
-                break;
+            Err(nix::errno::Errno::EINTR) => {
+                if STOP.load(Ordering::Relaxed) {
+                    return LoopExit::RequestedShutdown;
+                }
+                continue;
             }
+            Err(source) => return LoopExit::PollFailed { source },
         };
+
+        let revents = fds[0].revents().unwrap_or_else(PollFlags::empty);
+        if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+            return LoopExit::InputDisconnected {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("poll reported {revents:?}"),
+                ),
+            };
+        }
 
         let frames = match input.poll_frames() {
             Ok(fs) => fs,
-            Err(e) => {
-                warn!("evdev read error: {e}");
-                // On hot-unplug evdev returns ENODEV. Log and exit so
-                // systemd restarts us. A future enhancement could
-                // re-enumerate the device.
-                break;
+            Err(source) if source.raw_os_error() == Some(libc::ENODEV) => {
+                return LoopExit::InputDisconnected { source };
             }
+            Err(source) => return LoopExit::InputReadFailed { source },
         };
 
         if frames.is_empty() {
@@ -150,20 +183,20 @@ fn run(args: Args) -> Result<()> {
                 Some(contact) => pf.contacts.for_contact(contact),
                 None => pf.contacts.primary(),
             };
-            let action = fsm.step(frame, &mut detector, &config.scroll);
+            let action = fsm.step(frame, detector, &config.scroll);
             let now_state = fsm.state();
 
             match action {
                 Action::None => {}
                 Action::EmitWheelV(t) => {
-                    if let Err(e) = vwheel.emit_v(t) {
-                        warn!("uinput emit_v failed: {e}");
+                    if let Err(source) = vwheel.emit_v(t) {
+                        return LoopExit::VirtualWheelFailed { source };
                     }
                     debug!(ticks = t, "emit vertical");
                 }
                 Action::EmitWheelH(t) => {
-                    if let Err(e) = vwheel.emit_h(t) {
-                        warn!("uinput emit_h failed: {e}");
+                    if let Err(source) = vwheel.emit_h(t) {
+                        return LoopExit::VirtualWheelFailed { source };
                     }
                     debug!(ticks = t, "emit horizontal");
                 }
@@ -179,16 +212,12 @@ fn run(args: Args) -> Result<()> {
             //   otherwise → forward verbatim.
             if !matches!(now_state, FsmState::Scrolling { .. }) {
                 let strip_positions = matches!(prev_state, FsmState::Scrolling { .. });
-                if let Err(e) = vtouchpad.forward(&pf.events, strip_positions) {
-                    warn!("virtual touchpad forward failed: {e}");
+                if let Err(source) = vtouchpad.forward(&pf.events, strip_positions) {
+                    return LoopExit::VirtualTouchpadFailed { source };
                 }
             }
         }
     }
-
-    info!("shutting down");
-    // `Drop for InputDevice` releases EVIOCGRAB.
-    Ok(())
 }
 
 fn init_tracing(config: &Config, debug_flag: bool) {

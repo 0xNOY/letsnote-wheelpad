@@ -12,6 +12,7 @@
 //    the virtual pad only, so it can never have stale state from a
 //    transient grab/ungrab cycle.
 
+use std::io;
 use std::path::Path;
 
 use evdev::{
@@ -71,7 +72,7 @@ impl UinputWheel {
     /// (libinput convention). The caller already applied
     /// `reverse_vertical` flipping; this function does not interpret
     /// signs further.
-    pub fn emit_v(&mut self, ticks: i32) -> Result<()> {
+    pub fn emit_v(&mut self, ticks: i32) -> io::Result<()> {
         self.emit_axis(
             ticks,
             RelativeAxisType::REL_WHEEL,
@@ -80,7 +81,7 @@ impl UinputWheel {
     }
 
     /// Emit `ticks` horizontal wheel notches. Positive = scroll right.
-    pub fn emit_h(&mut self, ticks: i32) -> Result<()> {
+    pub fn emit_h(&mut self, ticks: i32) -> io::Result<()> {
         self.emit_axis(
             ticks,
             RelativeAxisType::REL_HWHEEL,
@@ -93,7 +94,7 @@ impl UinputWheel {
         ticks: i32,
         axis: RelativeAxisType,
         axis_hi_res: RelativeAxisType,
-    ) -> Result<()> {
+    ) -> io::Result<()> {
         if ticks == 0 {
             return Ok(());
         }
@@ -101,9 +102,7 @@ impl UinputWheel {
             InputEvent::new(EventType::RELATIVE, axis_hi_res.0, ticks * HI_RES_STEP),
             InputEvent::new(EventType::RELATIVE, axis.0, ticks),
         ];
-        self.dev
-            .emit(&events)
-            .map_err(|source| Error::UinputWrite { source })
+        self.dev.emit(&events)
     }
 }
 
@@ -230,7 +229,7 @@ impl UinputTouchpad {
     /// so libinput sees the BTN_TOUCH=0 / ABS_MT_TRACKING_ID=-1
     /// transition without a synthetic position jump from the prior
     /// pre-engagement position.
-    pub fn forward(&mut self, events: &[InputEvent], strip_positions: bool) -> Result<()> {
+    pub fn forward(&mut self, events: &[InputEvent], strip_positions: bool) -> io::Result<()> {
         let filtered: Vec<InputEvent> = events
             .iter()
             .copied()
@@ -256,8 +255,6 @@ impl UinputTouchpad {
         if filtered.is_empty() {
             return Ok(());
         }
-        self.dev
-            .emit(&filtered)
-            .map_err(|source| Error::UinputWrite { source })
+        self.dev.emit(&filtered)
     }
 }

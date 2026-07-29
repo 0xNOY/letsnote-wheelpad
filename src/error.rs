@@ -53,6 +53,12 @@ pub enum Error {
     #[error("EVIOCGRAB ioctl failed: {source}")]
     Grab { source: io::Error },
 
+    #[error("input proxy terminated: {source}")]
+    Runtime {
+        #[source]
+        source: crate::runtime::LoopExit,
+    },
+
     #[error("invalid device-name regex `{pattern}`: {source}")]
     RegexInvalid {
         pattern: String,

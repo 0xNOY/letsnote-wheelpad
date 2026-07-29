@@ -2,9 +2,12 @@
 // center coordinates, and turns the raw event stream into TouchFrames at
 // each SYN_REPORT. See linux-design.md §5.
 
+use std::io;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use evdev::{AbsoluteAxisType, Device, EventType, InputEvent, Key};
+use tracing::warn;
 
 use crate::detector::TouchSample;
 use crate::error::{Error, Result};
@@ -115,15 +118,34 @@ pub struct PhysicalFrame {
     pub events: Vec<InputEvent>,
 }
 
-impl Drop for InputDevice {
-    /// Panic-safe ungrab. The kernel releases EVIOCGRAB on FD close
-    /// regardless, but explicitly calling ungrab here means the
-    /// release happens deterministically during unwind, before the
-    /// FD's file struct is reaped — closing the race where a daemon
-    /// restart tries to re-grab before the kernel has finalized the
-    /// old FD.
+pub struct GrabGuard {
+    input: InputDevice,
+    active: bool,
+}
+
+impl Deref for GrabGuard {
+    type Target = InputDevice;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
+
+impl DerefMut for GrabGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.input
+    }
+}
+
+impl Drop for GrabGuard {
     fn drop(&mut self) {
-        let _ = self.device.ungrab();
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        if let Err(source) = self.input.device.ungrab() {
+            warn!(%source, "failed to release physical touchpad grab");
+        }
     }
 }
 
@@ -196,6 +218,16 @@ impl InputDevice {
         })
     }
 
+    pub fn grab(mut self) -> Result<GrabGuard> {
+        self.device
+            .grab()
+            .map_err(|source| Error::Grab { source })?;
+        Ok(GrabGuard {
+            input: self,
+            active: true,
+        })
+    }
+
     /// Find a touchpad whose name matches `regex`. Returns the first match
     /// found via `/dev/input/event*` enumeration.
     pub fn find_by_name(regex_str: &str) -> Result<PathBuf> {
@@ -226,12 +258,8 @@ impl InputDevice {
     /// evdev 0.12.2's synchronized iterator only yields complete
     /// SYN_REPORT-terminated blocks. An incomplete kernel read remains
     /// in the library's internal buffer for the next `fetch_events()`.
-    pub fn poll_frames(&mut self) -> Result<Vec<PhysicalFrame>> {
-        let events: Vec<InputEvent> = self
-            .device
-            .fetch_events()
-            .map_err(|source| Error::EvdevRead { source })?
-            .collect();
+    pub fn poll_frames(&mut self) -> io::Result<Vec<PhysicalFrame>> {
+        let events: Vec<InputEvent> = self.device.fetch_events()?.collect();
         let mut frames: Vec<PhysicalFrame> = Vec::new();
         let mut batch_events: Vec<InputEvent> = Vec::new();
         for ev in events {

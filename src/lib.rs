@@ -11,4 +11,5 @@ pub mod detector;
 pub mod error;
 pub mod evdev;
 pub mod fsm;
+pub mod runtime;
 pub mod uinput;
