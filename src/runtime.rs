@@ -185,6 +185,8 @@ impl LoopExit {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use nix::poll::{poll, PollFd, PollFlags};
+
     use super::*;
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -268,5 +270,21 @@ mod tests {
             before.contains(Signal::SIGINT),
             after.contains(Signal::SIGINT)
         );
+    }
+
+    #[test]
+    fn shutdown_signal_wakes_poll_without_input_activity() {
+        let mut signal = ShutdownSignal::new().unwrap();
+
+        // SAFETY: pthread_self returns the current valid pthread identifier,
+        // and pthread_kill only queues SIGTERM to that thread. ShutdownSignal
+        // has blocked SIGTERM first, so it is consumed through signalfd rather
+        // than invoking the process-default termination action.
+        let result = unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTERM) };
+        assert_eq!(result, 0);
+
+        let mut fds = [PollFd::new(signal.fd(), PollFlags::POLLIN)];
+        assert_eq!(poll(&mut fds, 1_000).unwrap(), 1);
+        assert!(signal.read_requested().unwrap());
     }
 }
