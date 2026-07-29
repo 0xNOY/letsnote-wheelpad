@@ -7,7 +7,6 @@ use evdev::raw_stream::RawDevice;
 use evdev::{
     AbsoluteAxisType, BusType, Device, EventType, InputEvent, InputId, Key, Synchronization,
 };
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use tracing::warn;
 
 use crate::detector::TouchSample;
@@ -560,12 +559,34 @@ fn slot_count_from_range(path: &Path, minimum: i32, maximum: i32) -> Result<usiz
 }
 
 fn set_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
-    let current = fcntl(fd, FcntlArg::F_GETFL)
-        .map(OFlag::from_bits_truncate)
-        .map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
-    fcntl(fd, FcntlArg::F_SETFL(current | OFlag::O_NONBLOCK))
-        .map(|_| ())
-        .map_err(|errno| io::Error::from_raw_os_error(errno as i32))
+    let current = get_status_flags(fd)?;
+    set_status_flags(fd, status_flags_with_nonblocking(current))
+}
+
+fn status_flags_with_nonblocking(flags: libc::c_int) -> libc::c_int {
+    flags | libc::O_NONBLOCK
+}
+
+fn get_status_flags(fd: std::os::fd::RawFd) -> io::Result<libc::c_int> {
+    // SAFETY: F_GETFL takes no variadic argument. `fd` is borrowed for the
+    // duration of this call and fcntl does not retain it.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(flags)
+    }
+}
+
+fn set_status_flags(fd: std::os::fd::RawFd, flags: libc::c_int) -> io::Result<()> {
+    // SAFETY: F_SETFL requires one integer variadic argument. `flags` is the
+    // raw F_GETFL result with only O_NONBLOCK added, and `fd` remains valid.
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 trait NonblockingEventSource {
@@ -1038,16 +1059,27 @@ mod tests {
     #[test]
     fn opening_flags_preserve_existing_status_and_add_nonblocking() {
         let (read_fd, write_fd) = pipe().unwrap();
-        let initial = OFlag::from_bits_truncate(fcntl(read_fd, FcntlArg::F_GETFL).unwrap());
-        fcntl(read_fd, FcntlArg::F_SETFL(initial | OFlag::O_ASYNC)).unwrap();
+        let initial = get_status_flags(read_fd).unwrap();
+        set_status_flags(read_fd, initial | libc::O_ASYNC).unwrap();
 
         set_nonblocking(read_fd).unwrap();
-        let final_flags = OFlag::from_bits_truncate(fcntl(read_fd, FcntlArg::F_GETFL).unwrap());
+        let final_flags = get_status_flags(read_fd).unwrap();
 
-        assert!(final_flags.contains(OFlag::O_NONBLOCK));
-        assert!(final_flags.contains(OFlag::O_ASYNC));
+        assert_ne!(final_flags & libc::O_NONBLOCK, 0);
+        assert_ne!(final_flags & libc::O_ASYNC, 0);
         close(read_fd).unwrap();
         close(write_fd).unwrap();
+    }
+
+    #[test]
+    fn nonblocking_flag_combination_preserves_unrecognized_bits() {
+        let unrecognized = 1 << 30;
+        let original = libc::O_RDWR | libc::O_ASYNC | unrecognized;
+
+        let combined = status_flags_with_nonblocking(original);
+
+        assert_eq!(combined & !libc::O_NONBLOCK, original);
+        assert_ne!(combined & libc::O_NONBLOCK, 0);
     }
 
     #[test]
