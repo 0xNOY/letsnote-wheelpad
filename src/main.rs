@@ -12,6 +12,7 @@ use letsnote_wheelpad::detector::{CircularDetector, CoordinateTransform};
 use letsnote_wheelpad::error::{Error, Result};
 use letsnote_wheelpad::evdev::{GrabGuard, InputDevice};
 use letsnote_wheelpad::fsm::{Action, Fsm, FsmState};
+use letsnote_wheelpad::router::{Router, RoutingMode};
 use letsnote_wheelpad::runtime::LoopExit;
 use letsnote_wheelpad::uinput::{UinputTouchpad, UinputWheel};
 
@@ -83,9 +84,8 @@ fn run(args: Args) -> Result<()> {
 
     // 4. Grab the physical pad permanently. After this point libinput
     //    sees no events from the physical device; everything flows
-    //    through our virtual touchpad. Releasing the grab is handled
-    //    by `Drop` on `input.device` (and by the panic-safety cleanup
-    //    after the main loop returns).
+    //    through our virtual touchpad. GrabGuard releases the grab on
+    //    every return path and during unwind.
     let mut input = input.grab()?;
     info!("physical touchpad grabbed (passthrough mode)");
 
@@ -100,6 +100,7 @@ fn run(args: Args) -> Result<()> {
     let mut detector =
         CircularDetector::with_geometry(transform, config.scroll.minimum_rotation_radius);
     let mut fsm = Fsm::with_transform(input.center_x, input.center_y, transform);
+    let mut router = Router::new();
 
     // 7. Signal handling.
     install_signal_handlers()?;
@@ -111,6 +112,7 @@ fn run(args: Args) -> Result<()> {
         &mut vwheel,
         &mut fsm,
         &mut detector,
+        &mut router,
         &config,
     );
     info!(reason = %exit, "input loop stopped");
@@ -127,9 +129,11 @@ fn run_event_loop(
     vwheel: &mut UinputWheel,
     fsm: &mut Fsm,
     detector: &mut CircularDetector,
+    router: &mut Router,
     config: &Config,
 ) -> LoopExit {
     let raw_fd = input.device.as_raw_fd();
+    let mut routed_events = Vec::new();
     loop {
         if STOP.load(Ordering::Relaxed) {
             return LoopExit::RequestedShutdown;
@@ -174,12 +178,9 @@ fn run_event_loop(
         }
 
         for pf in frames {
-            // Snapshot pre-step state. The forwarding decision uses
-            // BOTH pre and post: pre tells us whether positions need
-            // stripping (lift batch), post tells us whether to forward
-            // at all (suppress during Scrolling).
             let prev_state = fsm.state();
-            let frame = match fsm.contact_id() {
+            let tracked_before = fsm.contact_id();
+            let frame = match tracked_before {
                 Some(contact) => pf.contacts.for_contact(contact),
                 None => pf.contacts.primary(),
             };
@@ -202,19 +203,17 @@ fn run_event_loop(
                 }
             }
 
-            // Passthrough:
-            //   post = Scrolling → suppress entirely (cursor frozen).
-            //   pre = Scrolling && post != Scrolling → lift batch:
-            //          forward but strip position events, so libinput
-            //          sees BTN_TOUCH=0 / tracking_id=-1 without a
-            //          synthetic jump from the pre-engagement
-            //          coordinate.
-            //   otherwise → forward verbatim.
-            if !matches!(now_state, FsmState::Scrolling { .. }) {
-                let strip_positions = matches!(prev_state, FsmState::Scrolling { .. });
-                if let Err(source) = vtouchpad.forward(&pf.events, strip_positions) {
-                    return LoopExit::VirtualTouchpadFailed { source };
-                }
+            let capture = if matches!(prev_state, FsmState::Scrolling { .. }) {
+                tracked_before
+            } else if matches!(now_state, FsmState::Scrolling { .. }) {
+                fsm.contact_id()
+            } else {
+                None
+            };
+            let mode = capture.map_or(RoutingMode::Passthrough, RoutingMode::Capture);
+            router.route_frame(&pf.events, mode, &mut routed_events);
+            if let Err(source) = vtouchpad.forward(&routed_events) {
+                return LoopExit::VirtualTouchpadFailed { source };
             }
         }
     }
