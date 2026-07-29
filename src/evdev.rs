@@ -16,6 +16,16 @@ use crate::uinput::{TOUCHPAD_PRODUCT_ID, VENDOR_ID, WHEEL_PRODUCT_ID};
 
 const INACTIVE_TRACKING_ID: i32 = -1;
 const MAX_SUPPORTED_MT_SLOTS: usize = 256;
+const TOUCHPAD_BUTTONS: [Key; 8] = [
+    Key::BTN_LEFT,
+    Key::BTN_RIGHT,
+    Key::BTN_MIDDLE,
+    Key::BTN_SIDE,
+    Key::BTN_EXTRA,
+    Key::BTN_FORWARD,
+    Key::BTN_BACK,
+    Key::BTN_TASK,
+];
 
 nix::ioctl_read_buf!(eviocgmtslots, b'E', 0x0a, i32);
 
@@ -59,6 +69,7 @@ struct FrameState {
     slots: Vec<SlotState>,
     current_slot: Option<usize>,
     contact: bool,
+    pressed_buttons: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +77,7 @@ pub struct ContactSnapshot {
     slots: Vec<SlotState>,
     current_slot: Option<usize>,
     contact: bool,
+    pressed_buttons: u8,
 }
 
 impl ContactSnapshot {
@@ -128,6 +140,15 @@ impl ContactSnapshot {
         self.slots.len()
     }
 
+    pub fn is_quiescent(&self) -> bool {
+        !self.contact
+            && self.pressed_buttons == 0
+            && self
+                .slots
+                .iter()
+                .all(|slot| slot.tracking_id == INACTIVE_TRACKING_ID)
+    }
+
     pub(crate) fn tracking_ids(&self) -> impl Iterator<Item = i32> + '_ {
         self.slots.iter().map(|slot| slot.tracking_id)
     }
@@ -140,6 +161,15 @@ impl ContactSnapshot {
         slots: &[(i32, i32, i32)],
         current_slot: Option<usize>,
         contact: bool,
+    ) -> io::Result<Self> {
+        Self::from_slot_values_and_buttons(slots, current_slot, contact, &[])
+    }
+
+    pub fn from_slot_values_and_buttons(
+        slots: &[(i32, i32, i32)],
+        current_slot: Option<usize>,
+        contact: bool,
+        pressed_buttons: &[Key],
     ) -> io::Result<Self> {
         if slots.is_empty() {
             return Err(io::Error::new(
@@ -160,6 +190,7 @@ impl ContactSnapshot {
                 .collect(),
             current_slot,
             contact,
+            pressed_buttons: touchpad_button_mask_from_keys(pressed_buttons.iter().copied()),
         })
     }
 }
@@ -187,6 +218,64 @@ impl PhysicalFrame {
 pub struct GrabGuard {
     input: InputDevice,
     active: bool,
+}
+
+pub enum GrabAttempt {
+    Stable(GrabGuard),
+    Retry(InputDevice),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UngrabbedStartupAction {
+    WaitForQuiescence,
+    AttemptGrab,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrabbedStartupAction {
+    AcceptStableGrab,
+    ReleaseAndRetry,
+}
+
+#[derive(Debug, Default)]
+pub struct StartupCoordinator {
+    stable_grab: bool,
+    processor_initialized: bool,
+}
+
+impl StartupCoordinator {
+    pub fn inspect_ungrabbed(&mut self, snapshot: &ContactSnapshot) -> UngrabbedStartupAction {
+        self.stable_grab = false;
+        self.processor_initialized = false;
+        if snapshot.is_quiescent() {
+            UngrabbedStartupAction::AttemptGrab
+        } else {
+            UngrabbedStartupAction::WaitForQuiescence
+        }
+    }
+
+    pub fn inspect_grabbed(&mut self, snapshot: &ContactSnapshot) -> GrabbedStartupAction {
+        self.processor_initialized = false;
+        if snapshot.is_quiescent() {
+            self.stable_grab = true;
+            GrabbedStartupAction::AcceptStableGrab
+        } else {
+            self.stable_grab = false;
+            GrabbedStartupAction::ReleaseAndRetry
+        }
+    }
+
+    pub fn mark_processor_initialized(&mut self) {
+        assert!(
+            self.stable_grab,
+            "processor cannot initialize before a stable quiescent grab"
+        );
+        self.processor_initialized = true;
+    }
+
+    pub fn may_notify_ready(&self) -> bool {
+        self.stable_grab && self.processor_initialized
+    }
 }
 
 impl Deref for GrabGuard {
@@ -236,16 +325,17 @@ impl InputDevice {
                     reason: source.to_string(),
                 }
             })?;
-        let contact = device
+        let key_state = device
             .get_key_state()
-            .map_err(|source| Error::EvdevRead { source })?
-            .contains(Key::BTN_TOUCH);
+            .map_err(|source| Error::EvdevRead { source })?;
+        let contact = key_state.contains(Key::BTN_TOUCH);
         let slots =
             query_all_slots(&device, slot_count).map_err(|source| Error::EvdevRead { source })?;
         let state = FrameState {
             slots,
             current_slot: Some(current_slot),
             contact,
+            pressed_buttons: touchpad_button_mask(&key_state),
         };
 
         Ok(Self {
@@ -261,14 +351,55 @@ impl InputDevice {
         })
     }
 
-    pub fn grab(mut self) -> Result<GrabGuard> {
+    pub fn grab_if_quiescent(mut self) -> Result<GrabAttempt> {
         self.device
             .grab()
             .map_err(|source| Error::Grab { source })?;
-        Ok(GrabGuard {
-            input: self,
-            active: true,
-        })
+        if let Err(source) = self
+            .device
+            .fetch_events()
+            .map(|events| events.for_each(drop))
+        {
+            if let Err(ungrab_source) = self.device.ungrab() {
+                warn!(
+                    %ungrab_source,
+                    "failed to release physical touchpad grab after event-drain failure"
+                );
+            }
+            return Err(Error::EvdevRead { source });
+        }
+        let refreshed = match self.query_frame_state() {
+            Ok(state) => state,
+            Err(source) => {
+                if let Err(ungrab_source) = self.device.ungrab() {
+                    warn!(
+                        %ungrab_source,
+                        "failed to release physical touchpad grab after state-query failure"
+                    );
+                }
+                return Err(Error::EvdevRead { source });
+            }
+        };
+        self.state = refreshed;
+        self.pending_events.clear();
+        if self.snapshot().is_quiescent() {
+            Ok(GrabAttempt::Stable(GrabGuard {
+                input: self,
+                active: true,
+            }))
+        } else {
+            self.device
+                .ungrab()
+                .map_err(|source| Error::Ungrab { source })?;
+            Ok(GrabAttempt::Retry(self))
+        }
+    }
+
+    pub fn refresh_ungrabbed_state(&mut self) -> io::Result<()> {
+        self.device.fetch_events()?.for_each(drop);
+        self.pending_events.clear();
+        self.state = self.query_frame_state()?;
+        Ok(())
     }
 
     pub fn snapshot(&self) -> ContactSnapshot {
@@ -340,11 +471,13 @@ impl InputDevice {
             abs_state[AbsoluteAxisType::ABS_MT_SLOT.0 as usize].value,
             self.state.slots.len(),
         )?;
-        let contact = self.device.get_key_state()?.contains(Key::BTN_TOUCH);
+        let key_state = self.device.get_key_state()?;
+        let contact = key_state.contains(Key::BTN_TOUCH);
         Ok(FrameState {
             slots: query_all_slots(&self.device, self.state.slots.len())?,
             current_slot: Some(current_slot),
             contact,
+            pressed_buttons: touchpad_button_mask(&key_state),
         })
     }
 }
@@ -462,6 +595,27 @@ fn query_slot_values(
     unsafe { eviocgmtslots(device.as_raw_fd(), &mut request) }
         .map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
     Ok(request.split_off(1))
+}
+
+fn touchpad_button_mask(keys: &evdev::AttributeSet<Key>) -> u8 {
+    touchpad_button_mask_from_keys(
+        TOUCHPAD_BUTTONS
+            .into_iter()
+            .filter(|key| keys.contains(*key)),
+    )
+}
+
+fn touchpad_button_mask_from_keys(keys: impl IntoIterator<Item = Key>) -> u8 {
+    let mut mask = 0_u8;
+    for key in keys {
+        if let Some(index) = TOUCHPAD_BUTTONS
+            .iter()
+            .position(|candidate| *candidate == key)
+        {
+            mask |= 1 << index;
+        }
+    }
+    mask
 }
 
 fn reconciliation_events(
@@ -588,6 +742,20 @@ impl FrameState {
             self.contact = event.value() != 0;
             return Ok(());
         }
+        if event.event_type() == EventType::KEY {
+            let key = Key(event.code());
+            if let Some(index) = TOUCHPAD_BUTTONS
+                .iter()
+                .position(|candidate| *candidate == key)
+            {
+                if event.value() == 0 {
+                    self.pressed_buttons &= !(1 << index);
+                } else {
+                    self.pressed_buttons |= 1 << index;
+                }
+            }
+            return Ok(());
+        }
         if event.event_type() != EventType::ABSOLUTE {
             return Ok(());
         }
@@ -619,6 +787,7 @@ impl FrameState {
             slots: self.slots.clone(),
             current_slot: self.current_slot,
             contact: self.contact,
+            pressed_buttons: self.pressed_buttons,
         }
     }
 }
@@ -676,6 +845,7 @@ mod tests {
             slots: vec![SlotState::default(); slot_count],
             current_slot: Some(0),
             contact: true,
+            pressed_buttons: 0,
         }
     }
 
@@ -695,17 +865,71 @@ mod tests {
     }
 
     #[test]
-    fn startup_snapshot_can_contain_an_active_contact() {
-        let snapshot =
-            ContactSnapshot::from_slot_values(&[(-1, 0, 0), (41, 800, 500)], Some(1), true)
+    fn startup_detects_every_non_quiescent_input_class() {
+        let active_tracking =
+            ContactSnapshot::from_slot_values(&[(-1, 0, 0), (41, 800, 500)], Some(1), false)
                 .unwrap();
+        let touch = ContactSnapshot::from_slot_values(&[(-1, 0, 0); 2], Some(0), true).unwrap();
+        let button = ContactSnapshot::from_slot_values_and_buttons(
+            &[(-1, 0, 0); 2],
+            Some(0),
+            false,
+            &[Key::BTN_LEFT],
+        )
+        .unwrap();
+        let mut coordinator = StartupCoordinator::default();
+
+        for snapshot in [&active_tracking, &touch, &button] {
+            assert!(!snapshot.is_quiescent());
+            assert_eq!(
+                coordinator.inspect_ungrabbed(snapshot),
+                UngrabbedStartupAction::WaitForQuiescence
+            );
+        }
+    }
+
+    #[test]
+    fn startup_retries_when_input_activates_during_grab_window() {
+        let quiet = ContactSnapshot::from_slot_values(&[(-1, 0, 0); 2], Some(0), false).unwrap();
+        let raced = ContactSnapshot::from_slot_values(&[(-1, 0, 0), (41, 800, 500)], Some(1), true)
+            .unwrap();
+        let mut coordinator = StartupCoordinator::default();
+
         assert_eq!(
-            snapshot.primary().contact_id,
-            Some(ContactId {
-                slot: 1,
-                tracking_id: 41
-            })
+            coordinator.inspect_ungrabbed(&quiet),
+            UngrabbedStartupAction::AttemptGrab
         );
+        assert_eq!(
+            coordinator.inspect_grabbed(&raced),
+            GrabbedStartupAction::ReleaseAndRetry
+        );
+        assert!(!coordinator.may_notify_ready());
+        assert_eq!(
+            coordinator.inspect_ungrabbed(&raced),
+            UngrabbedStartupAction::WaitForQuiescence
+        );
+        assert_eq!(
+            coordinator.inspect_ungrabbed(&quiet),
+            UngrabbedStartupAction::AttemptGrab
+        );
+        assert_eq!(
+            coordinator.inspect_grabbed(&quiet),
+            GrabbedStartupAction::AcceptStableGrab
+        );
+    }
+
+    #[test]
+    fn startup_ready_requires_stable_grab_and_processor_initialization() {
+        let quiet = ContactSnapshot::from_slot_values(&[(-1, 0, 0); 2], Some(0), false).unwrap();
+        let mut coordinator = StartupCoordinator::default();
+
+        assert!(!coordinator.may_notify_ready());
+        coordinator.inspect_ungrabbed(&quiet);
+        assert!(!coordinator.may_notify_ready());
+        coordinator.inspect_grabbed(&quiet);
+        assert!(!coordinator.may_notify_ready());
+        coordinator.mark_processor_initialized();
+        assert!(coordinator.may_notify_ready());
     }
 
     #[test]

@@ -316,12 +316,16 @@ fn missing_captured_contact_ends_session_during_liveness_reconciliation() {
 }
 
 #[test]
-fn startup_with_active_contact_uses_synchronized_identity() {
-    let initial = snapshot_a(0.0);
+fn confirmed_quiescent_startup_initializes_router_and_processor() {
+    let initial =
+        ContactSnapshot::from_slot_values(&[(-1, 0, 0); SLOT_COUNT], Some(CONTACT_A.slot), false)
+            .unwrap();
     let mut harness = Harness::new(initial);
     harness.process(
         snapshot_a(0.0),
         frame(vec![
+            key(Key::BTN_TOUCH, 1),
+            abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, CONTACT_A.tracking_id),
             abs(AbsoluteAxisType::ABS_MT_POSITION_X, 800),
             abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 500),
         ]),

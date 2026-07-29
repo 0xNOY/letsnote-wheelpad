@@ -9,7 +9,10 @@ use tracing_subscriber::EnvFilter;
 use letsnote_wheelpad::config::Config;
 use letsnote_wheelpad::detector::CoordinateTransform;
 use letsnote_wheelpad::error::{Error, Result};
-use letsnote_wheelpad::evdev::{GrabGuard, InputDevice, PhysicalFrame};
+use letsnote_wheelpad::evdev::{
+    GrabAttempt, GrabGuard, GrabbedStartupAction, InputDevice, PhysicalFrame, StartupCoordinator,
+    UngrabbedStartupAction,
+};
 use letsnote_wheelpad::fsm::Action;
 use letsnote_wheelpad::proxy::FrameProcessor;
 use letsnote_wheelpad::runtime::{InstanceLock, LoopExit, ShutdownSignal};
@@ -86,19 +89,45 @@ fn run(args: Args) -> Result<()> {
     let mut vwheel = UinputWheel::create()?;
     info!("virtual wheel created");
 
-    // 4. Grab the physical pad permanently. After this point libinput
-    //    sees no events from the physical device; everything flows
-    //    through our virtual touchpad. GrabGuard releases the grab on
-    //    every return path and during unwind.
-    let mut input = input.grab()?;
+    // 4. Do not cut an active physical lifecycle away from its current
+    //    consumers. Wait ungrabbed until all contacts and touchpad
+    //    buttons are released, then grab and immediately re-query to
+    //    close the observation/grab race. If input became active in
+    //    that window, release the grab and retry.
+    let mut startup = StartupCoordinator::default();
+    let mut ungrabbed = input;
+    let mut input = loop {
+        match startup.inspect_ungrabbed(&ungrabbed.snapshot()) {
+            UngrabbedStartupAction::WaitForQuiescence => {
+                info!("waiting for touchpad contacts and buttons to be released");
+                match wait_for_startup_change(&mut ungrabbed, &mut shutdown) {
+                    Ok(StartupWake::InputChanged) => continue,
+                    Ok(StartupWake::RequestedShutdown) => return Ok(()),
+                    Err(source) => return Err(Error::Runtime { source }),
+                }
+            }
+            UngrabbedStartupAction::AttemptGrab => match ungrabbed.grab_if_quiescent()? {
+                GrabAttempt::Stable(guard) => {
+                    debug_assert_eq!(
+                        startup.inspect_grabbed(&guard.snapshot()),
+                        GrabbedStartupAction::AcceptStableGrab
+                    );
+                    break guard;
+                }
+                GrabAttempt::Retry(next) => {
+                    debug_assert_eq!(
+                        startup.inspect_grabbed(&next.snapshot()),
+                        GrabbedStartupAction::ReleaseAndRetry
+                    );
+                    ungrabbed = next;
+                }
+            },
+        }
+    };
     info!("physical touchpad grabbed (passthrough mode)");
 
-    // 5. Notify systemd we're ready.
-    if let Err(e) = sd_notify_ready() {
-        warn!("sd_notify Ready failed (acceptable outside systemd): {e}");
-    }
-
-    // 6. Build the algorithm and FSM. History capacity is fixed at 20
+    // 5. Build the algorithm and FSM from the confirmed quiescent
+    //    snapshot. History capacity is fixed at 20
     //    to match Windows WheelPad exactly (D-021-followup).
     let transform = CoordinateTransform::new(config.scroll.coordinate_y_scale);
     let mut processor = FrameProcessor::new(
@@ -108,6 +137,14 @@ fn run(args: Args) -> Result<()> {
         config.scroll.minimum_rotation_radius,
         &input.snapshot(),
     );
+
+    // 6. Notify systemd only after the grab has been rechecked and all
+    //    proxy state is initialized.
+    startup.mark_processor_initialized();
+    debug_assert!(startup.may_notify_ready());
+    if let Err(e) = sd_notify_ready() {
+        warn!("sd_notify Ready failed (acceptable outside systemd): {e}");
+    }
 
     // 7. Main loop.
     let exit = run_event_loop(
@@ -123,6 +160,71 @@ fn run(args: Args) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Runtime { source: exit })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupWake {
+    InputChanged,
+    RequestedShutdown,
+}
+
+fn wait_for_startup_change(
+    input: &mut InputDevice,
+    shutdown: &mut ShutdownSignal,
+) -> std::result::Result<StartupWake, LoopExit> {
+    let raw_fd = input.device.as_raw_fd();
+    loop {
+        let (input_revents, signal_revents) = {
+            // SAFETY: raw_fd remains owned by `input.device` throughout
+            // this poll call and is not accessed through another owner.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+            let signal_fd = shutdown.fd().as_fd();
+            let mut fds = [
+                PollFd::new(&borrowed, PollFlags::POLLIN),
+                PollFd::new(&signal_fd, PollFlags::POLLIN),
+            ];
+            match poll(&mut fds, -1) {
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(source) => return Err(LoopExit::PollFailed { source }),
+            }
+            (
+                fds[0].revents().unwrap_or_else(PollFlags::empty),
+                fds[1].revents().unwrap_or_else(PollFlags::empty),
+            )
+        };
+
+        if signal_revents.contains(PollFlags::POLLIN) {
+            match shutdown.read_requested() {
+                Ok(true) => return Ok(StartupWake::RequestedShutdown),
+                Ok(false) => {}
+                Err(source) => return Err(LoopExit::SignalReadFailed { source }),
+            }
+        }
+        if signal_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+        {
+            return Err(LoopExit::SignalReadFailed {
+                source: nix::errno::Errno::EIO,
+            });
+        }
+        if input_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+            return Err(LoopExit::InputDisconnected {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("startup poll reported {input_revents:?}"),
+                ),
+            });
+        }
+        if input_revents.contains(PollFlags::POLLIN) {
+            return match input.refresh_ungrabbed_state() {
+                Ok(()) => Ok(StartupWake::InputChanged),
+                Err(source) if source.raw_os_error() == Some(libc::ENODEV) => {
+                    Err(LoopExit::InputDisconnected { source })
+                }
+                Err(source) => Err(LoopExit::InputReadFailed { source }),
+            };
+        }
     }
 }
 

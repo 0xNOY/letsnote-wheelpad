@@ -72,6 +72,9 @@ pub enum Error {
     #[error("EVIOCGRAB ioctl failed: {source}")]
     Grab { source: io::Error },
 
+    #[error("EVIOCGRAB release failed during startup retry: {source}")]
+    Ungrab { source: io::Error },
+
     #[error("input proxy terminated: {source}")]
     Runtime {
         #[source]
