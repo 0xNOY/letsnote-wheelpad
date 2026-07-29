@@ -141,6 +141,10 @@ impl ContactSnapshot {
         self.slots.len()
     }
 
+    pub fn selected_slot(&self) -> Option<usize> {
+        self.current_slot
+    }
+
     pub fn is_quiescent(&self) -> bool {
         !self.contact
             && self.pressed_buttons == 0

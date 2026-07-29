@@ -141,7 +141,20 @@ fn run(args: Args) -> Result<()> {
     };
     info!("physical touchpad grabbed (passthrough mode)");
 
-    // 5. Build the algorithm and FSM from the confirmed quiescent
+    // 5. Align the virtual Type B selected slot before any position-only
+    //    physical frame can be forwarded.
+    let confirmed_snapshot = input.snapshot();
+    let confirmed_slot = confirmed_snapshot
+        .selected_slot()
+        .ok_or_else(|| Error::EvdevState {
+            path: device_path.clone(),
+            reason: "confirmed quiescent state has no selected MT slot".to_string(),
+        })?;
+    vtouchpad
+        .select_mt_slot(confirmed_slot)
+        .map_err(|source| Error::UinputWrite { source })?;
+
+    // 6. Build the algorithm and FSM from the same confirmed quiescent
     //    snapshot. History capacity is fixed at 20
     //    to match Windows WheelPad exactly (D-021-followup).
     let transform = CoordinateTransform::new(config.scroll.coordinate_y_scale);
@@ -150,10 +163,10 @@ fn run(args: Args) -> Result<()> {
         input.center_y,
         transform,
         config.scroll.minimum_rotation_radius,
-        &input.snapshot(),
+        &confirmed_snapshot,
     );
 
-    // 6. Notify systemd only after the grab has been rechecked and all
+    // 7. Notify systemd only after the grab has been rechecked and all
     //    proxy state is initialized.
     startup.mark_processor_initialized();
     debug_assert!(startup.may_notify_ready());
@@ -161,7 +174,7 @@ fn run(args: Args) -> Result<()> {
         warn!("sd_notify Ready failed (acceptable outside systemd): {e}");
     }
 
-    // 7. Main loop.
+    // 8. Main loop.
     let exit = run_event_loop(
         &mut input,
         &mut vtouchpad,

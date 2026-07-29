@@ -108,6 +108,11 @@ impl Router {
             _ => false,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn selected_slot(&self) -> Option<usize> {
+        self.current_slot
+    }
 }
 
 #[cfg(test)]

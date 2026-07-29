@@ -18,8 +18,8 @@ use std::path::Path;
 use evdev::{
     raw_stream::RawDevice,
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AbsInfo, AttributeSet, BusType, EventType, InputEvent, InputId, PropType, RelativeAxisType,
-    UinputAbsSetup,
+    AbsInfo, AbsoluteAxisType, AttributeSet, BusType, EventType, InputEvent, InputId, PropType,
+    RelativeAxisType, UinputAbsSetup,
 };
 use tracing::warn;
 
@@ -219,10 +219,28 @@ impl UinputTouchpad {
         Ok(Self { dev })
     }
 
+    pub fn select_mt_slot(&mut self, slot: usize) -> io::Result<()> {
+        self.dev.emit(&[mt_slot_event(slot)?])
+    }
+
     /// Emit one frame after event-level routing. `events` must not
     /// contain SYN_REPORT because evdev's `VirtualDevice::emit()`
     /// appends exactly one report terminator.
     pub fn forward(&mut self, events: &[InputEvent]) -> io::Result<()> {
         self.dev.emit(events)
     }
+}
+
+pub(crate) fn mt_slot_event(slot: usize) -> io::Result<InputEvent> {
+    let value = i32::try_from(slot).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("MT slot {slot} cannot be represented as i32"),
+        )
+    })?;
+    Ok(InputEvent::new(
+        EventType::ABSOLUTE,
+        AbsoluteAxisType::ABS_MT_SLOT.0,
+        value,
+    ))
 }
