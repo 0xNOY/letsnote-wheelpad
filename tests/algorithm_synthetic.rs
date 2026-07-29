@@ -194,17 +194,89 @@ fn engagement_threshold_pi_over_12() {
 #[test]
 fn radial_gate_default_width_requires_outer_ring() {
     // DetectAreaWidth = 0 → r ≥ 200 units from center.
-    assert!(!radial_gate_ok(500, 500, TouchSample { x: 500, y: 500 }, 0));
-    assert!(!radial_gate_ok(500, 500, TouchSample { x: 600, y: 500 }, 0)); // r = 100
-    assert!(radial_gate_ok(500, 500, TouchSample { x: 700, y: 500 }, 0)); // r = 200
-    assert!(radial_gate_ok(500, 500, TouchSample { x: 800, y: 500 }, 0)); // r = 300
+    assert!(!radial_gate_ok(
+        500,
+        500,
+        TouchSample { x: 500, y: 500 },
+        0,
+        200.0,
+        1.0
+    ));
+    assert!(!radial_gate_ok(
+        500,
+        500,
+        TouchSample { x: 600, y: 500 },
+        0,
+        200.0,
+        1.0
+    )); // r = 100
+    assert!(radial_gate_ok(
+        500,
+        500,
+        TouchSample { x: 700, y: 500 },
+        0,
+        200.0,
+        1.0
+    )); // r = 200
+    assert!(radial_gate_ok(
+        500,
+        500,
+        TouchSample { x: 800, y: 500 },
+        0,
+        200.0,
+        1.0
+    )); // r = 300
 }
 
 #[test]
 fn radial_gate_max_width_engages_anywhere() {
     // DetectAreaWidth = 10 → r ≥ 0 (whole pad active).
-    assert!(radial_gate_ok(500, 500, TouchSample { x: 500, y: 500 }, 10));
-    assert!(radial_gate_ok(500, 500, TouchSample { x: 600, y: 500 }, 10));
+    assert!(radial_gate_ok(
+        500,
+        500,
+        TouchSample { x: 500, y: 500 },
+        10,
+        200.0,
+        1.0
+    ));
+    assert!(radial_gate_ok(
+        500,
+        500,
+        TouchSample { x: 600, y: 500 },
+        10,
+        200.0,
+        1.0
+    ));
+}
+
+#[test]
+fn radial_gate_supports_high_resolution_anisotropic_coordinates() {
+    // A circular pad can report different X/Y coordinate densities.
+    // Scaling Y by 4/3 makes these equal physical distances equivalent.
+    assert!(radial_gate_ok(
+        3495,
+        2965,
+        TouchSample { x: 5460, y: 2965 },
+        0,
+        1965.0,
+        4.0 / 3.0
+    ));
+    assert!(radial_gate_ok(
+        3495,
+        2965,
+        TouchSample { x: 3495, y: 4439 },
+        0,
+        1965.0,
+        4.0 / 3.0
+    ));
+    assert!(!radial_gate_ok(
+        3495,
+        2965,
+        TouchSample { x: 5000, y: 2965 },
+        0,
+        1965.0,
+        4.0 / 3.0
+    ));
 }
 
 #[test]

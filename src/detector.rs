@@ -187,12 +187,14 @@ pub fn radial_gate_ok(
     center_y: i32,
     s: TouchSample,
     detect_area_width: i32,
+    detect_area_radius: f64,
+    detect_area_aspect_ratio: f64,
 ) -> bool {
-    let dx = (s.x - center_x) as i64;
-    let dy = (s.y - center_y) as i64;
-    let r2 = dx * dx + dy * dy;
-    let w = (10 - detect_area_width.clamp(0, 10)) as i64;
-    r2 >= (w * w) * 400
+    let dx = (s.x - center_x) as f64;
+    let dy = (s.y - center_y) as f64 * detect_area_aspect_ratio;
+    let width_fraction = (10 - detect_area_width.clamp(0, 10)) as f64 / 10.0;
+    let inner_radius = detect_area_radius * width_fraction;
+    dx * dx + dy * dy >= inner_radius * inner_radius
 }
 
 /// Horizontal-arc test (FUN_140005a00 lines 65-74). Returns true if the

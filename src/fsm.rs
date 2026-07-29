@@ -94,7 +94,14 @@ impl Fsm {
             (FsmState::Idle, false, _) | (FsmState::Idle, true, None) => Action::None,
             (FsmState::Idle, true, Some(s)) => {
                 // Fresh touch-down: radial-gate classifier (FUN_140005a00).
-                if radial_gate_ok(self.center_x, self.center_y, s, scroll.detect_area_width) {
+                if radial_gate_ok(
+                    self.center_x,
+                    self.center_y,
+                    s,
+                    scroll.detect_area_width,
+                    scroll.detect_area_radius,
+                    scroll.detect_area_aspect_ratio,
+                ) {
                     // Outside dead zone → MOVING. Capture engage_start
                     // here, matching DAT_14003cc18 being set at
                     // FUN_1400046a0 line 203 only on the state 1 → state 3
@@ -131,7 +138,14 @@ impl Fsm {
                 Action::None
             }
             (FsmState::Moving { engage_start }, true, Some(s)) => {
-                if !radial_gate_ok(self.center_x, self.center_y, s, scroll.detect_area_width) {
+                if !radial_gate_ok(
+                    self.center_x,
+                    self.center_y,
+                    s,
+                    scroll.detect_area_width,
+                    scroll.detect_area_radius,
+                    scroll.detect_area_aspect_ratio,
+                ) {
                     // Slipped back into the dead zone — fall back to
                     // Contact (FUN_1400046a0 case 3, lines 127-137).
                     self.state = FsmState::Contact { origin: s };

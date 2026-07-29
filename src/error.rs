@@ -19,6 +19,13 @@ pub enum Error {
         expected: &'static str,
     },
 
+    #[error("config value out of range: {key} = {value}; expected {expected}")]
+    ConfigFloatRange {
+        key: &'static str,
+        value: f64,
+        expected: &'static str,
+    },
+
     #[error("could not find a touchpad matching `{regex}`. Set `device = \"/dev/input/eventN\"` in the config to override.")]
     DeviceNotFound { regex: String },
 

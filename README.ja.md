@@ -65,6 +65,8 @@ horizontal_enable    = false  # 下端ウェッジでの横スクロールを有
 reverse_horizontal   = false
 sensitivity          = 0      # -2..+2 ; 小さいほど低感度
 detect_area_width    = 0      # 0..10 ; 0=外周のみ, 10=全面
+detect_area_radius   = 200.0  # width=0 時の内半径（X軸の座標単位）
+detect_area_aspect_ratio = 1.0 # Y/X の座標密度比
 horizontal_start     = 2      # 円弧開始位置 (π/8 単位 ; 2 → 45°)
 horizontal_end       = 6      # 円弧終了位置 (π/8 単位 ; 6 → 135°)
 
@@ -80,6 +82,8 @@ level = "info"  # trace | debug | info | warn | error
 | `scroll.reverse_horizontal` | `false` | bool | |
 | `scroll.sensitivity` | `0` | -2..+2 | 倍率テーブル `[10, 14, 20, 28, 40]` のインデックス。 |
 | `scroll.detect_area_width` | `0` | 0..10 | `0`=外周のみ、`10`=全面でスクロール開始可能。 |
+| `scroll.detect_area_radius` | `200.0` | > 0 | `width=0` 時の内側デッドゾーン半径（X軸の生座標単位）。反応領域が広すぎる場合は大きくする。 |
+| `scroll.detect_area_aspect_ratio` | `1.0` | > 0 | Y方向の距離に掛ける補正値。円形パッドの座標密度が縦横で異なる場合は `Xの範囲 / Yの範囲` を指定。 |
 | `scroll.horizontal_start` | `2` | 0..15 | π/8 単位。45°→135° のデフォルトはパッド下端。 |
 | `scroll.horizontal_end` | `6` | 0..15 | |
 

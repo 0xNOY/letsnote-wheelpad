@@ -65,6 +65,8 @@ horizontal_enable    = false  # enable bottom-edge horizontal-scroll wedge
 reverse_horizontal   = false
 sensitivity          = 0      # -2..+2 ; lower = less sensitive
 detect_area_width    = 0      # 0..10 ; 0 = outer ring only, 10 = whole pad
+detect_area_radius   = 200.0  # inner radius at width 0, in X-axis units
+detect_area_aspect_ratio = 1.0 # Y/X coordinate-density ratio
 horizontal_start     = 2      # arc start in π/8 units (2 → 45°)
 horizontal_end       = 6      # arc end in π/8 units (6 → 135°)
 
@@ -80,6 +82,8 @@ level = "info"  # trace | debug | info | warn | error
 | `scroll.reverse_horizontal` | `false` | bool | |
 | `scroll.sensitivity` | `0` | -2..+2 | Indexes the multiplier table `[10, 14, 20, 28, 40]`. |
 | `scroll.detect_area_width` | `0` | 0..10 | `0` = require finger near the edge; `10` = whole pad. |
+| `scroll.detect_area_radius` | `200.0` | > 0 | Inner dead-zone radius at width `0`, in raw X-axis units. Increase it if the active ring is too wide. |
+| `scroll.detect_area_aspect_ratio` | `1.0` | > 0 | Multiplier applied to Y distances. Set it to `X range / Y range` when a circular pad reports anisotropic coordinates. |
 | `scroll.horizontal_start` | `2` | 0..15 | π/8 units. Default 45° → 135° = the bottom edge of the pad. |
 | `scroll.horizontal_end` | `6` | 0..15 | |
 
