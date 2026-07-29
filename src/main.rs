@@ -149,7 +149,7 @@ fn run_event_loop(
             let timeout_ms = if processor.is_scrolling() { 1_000 } else { -1 };
             match poll(&mut fds, timeout_ms) {
                 Ok(0) => {
-                    let frame = match input.reconcile_frame() {
+                    let frame = match input.reconcile_liveness_frame() {
                         Ok(frame) => frame,
                         Err(source) => return LoopExit::InputReadFailed { source },
                     };

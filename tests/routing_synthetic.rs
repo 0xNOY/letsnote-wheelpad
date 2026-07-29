@@ -207,6 +207,61 @@ fn second_contact_add_move_and_lift_remain_routed() {
 }
 
 #[test]
+fn lost_sync_forwards_reconstructed_non_captured_positions_while_scrolling() {
+    let contact_b = ContactId {
+        slot: 0,
+        tracking_id: 10,
+    };
+    let mut harness = Harness::new(empty_snapshot());
+    start_and_engage(&mut harness);
+    let mut slots = [(-1, 0, 0); SLOT_COUNT];
+    slots[CONTACT_A.slot] = (CONTACT_A.tracking_id, 777, 615);
+    slots[contact_b.slot] = (contact_b.tracking_id, 200, 300);
+    harness.process(
+        ContactSnapshot::from_slot_values(&slots, Some(CONTACT_A.slot), true).unwrap(),
+        frame(vec![
+            abs(AbsoluteAxisType::ABS_MT_SLOT, contact_b.slot as i32),
+            abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, contact_b.tracking_id),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 200),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 300),
+            abs(AbsoluteAxisType::ABS_MT_SLOT, CONTACT_A.slot as i32),
+        ]),
+        false,
+    );
+
+    slots[CONTACT_A.slot] = (CONTACT_A.tracking_id, 760, 620);
+    slots[contact_b.slot] = (contact_b.tracking_id, 240, 340);
+    harness.process(
+        ContactSnapshot::from_slot_values(&slots, Some(CONTACT_A.slot), true).unwrap(),
+        frame(vec![
+            abs(AbsoluteAxisType::ABS_MT_SLOT, CONTACT_A.slot as i32),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 760),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 620),
+            abs(AbsoluteAxisType::ABS_MT_SLOT, contact_b.slot as i32),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 240),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 340),
+            abs(AbsoluteAxisType::ABS_MT_SLOT, CONTACT_A.slot as i32),
+        ]),
+        true,
+    );
+
+    assert!(harness.processor.is_scrolling());
+    assert!(harness.routed.iter().any(|event| {
+        event.code() == AbsoluteAxisType::ABS_MT_POSITION_X.0 && event.value() == 240
+    }));
+    assert!(harness.routed.iter().any(|event| {
+        event.code() == AbsoluteAxisType::ABS_MT_POSITION_Y.0 && event.value() == 340
+    }));
+    assert!(!harness.routed.iter().any(|event| {
+        matches!(event.value(), 760 | 620)
+            && matches!(
+                AbsoluteAxisType(event.code()),
+                AbsoluteAxisType::ABS_MT_POSITION_X | AbsoluteAxisType::ABS_MT_POSITION_Y
+            )
+    }));
+}
+
+#[test]
 fn same_slot_reuse_is_not_captured() {
     let mut harness = Harness::new(empty_snapshot());
     start_and_engage(&mut harness);

@@ -19,6 +19,12 @@ const MAX_SUPPORTED_MT_SLOTS: usize = 256;
 
 nix::ioctl_read_buf!(eviocgmtslots, b'E', 0x0a, i32);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconciliationKind {
+    LostSynchronization,
+    LivenessCheck,
+}
+
 pub struct InputDevice {
     pub device: RawDevice,
     pub abs_x_min: i32,
@@ -297,7 +303,7 @@ impl InputDevice {
         while let Some(end) = self.pending_events.iter().position(is_syn_report) {
             let events = self.pending_events.drain(..=end).collect::<Vec<_>>();
             if events.iter().any(is_syn_dropped) {
-                frames.push(self.reconcile_frame()?);
+                frames.push(self.reconcile_frame(ReconciliationKind::LostSynchronization)?);
                 continue;
             }
             for event in &events {
@@ -312,10 +318,14 @@ impl InputDevice {
         Ok(frames)
     }
 
-    pub fn reconcile_frame(&mut self) -> io::Result<PhysicalFrame> {
+    pub fn reconcile_liveness_frame(&mut self) -> io::Result<PhysicalFrame> {
+        self.reconcile_frame(ReconciliationKind::LivenessCheck)
+    }
+
+    fn reconcile_frame(&mut self, kind: ReconciliationKind) -> io::Result<PhysicalFrame> {
         let previous = self.state.clone();
         let refreshed = self.query_frame_state()?;
-        let events = reconciliation_events(&previous, &refreshed);
+        let events = reconciliation_events(&previous, &refreshed, kind)?;
         self.state = refreshed;
         Ok(PhysicalFrame {
             contacts: self.state.snapshot(),
@@ -454,24 +464,56 @@ fn query_slot_values(
     Ok(request.split_off(1))
 }
 
-fn reconciliation_events(previous: &FrameState, refreshed: &FrameState) -> Vec<InputEvent> {
+fn reconciliation_events(
+    previous: &FrameState,
+    refreshed: &FrameState,
+    kind: ReconciliationKind,
+) -> io::Result<Vec<InputEvent>> {
+    if previous.slots.len() != refreshed.slots.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MT slot count changed during reconciliation",
+        ));
+    }
+    let final_slot = refreshed.current_slot.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refreshed Type B state has no selected MT slot",
+        )
+    })?;
+    if final_slot >= refreshed.slots.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refreshed current MT slot {final_slot} outside 0..{}",
+                refreshed.slots.len()
+            ),
+        ));
+    }
+
     let mut events = Vec::new();
     for (slot, (old, new)) in previous.slots.iter().zip(&refreshed.slots).enumerate() {
-        if old.tracking_id == new.tracking_id {
-            continue;
+        let identity_changed = old.tracking_id != new.tracking_id;
+        let rebuild_position = new.tracking_id != INACTIVE_TRACKING_ID
+            && (identity_changed || kind == ReconciliationKind::LostSynchronization);
+        if identity_changed || rebuild_position {
+            events.push(abs_event(AbsoluteAxisType::ABS_MT_SLOT, slot as i32));
         }
-        events.push(abs_event(AbsoluteAxisType::ABS_MT_SLOT, slot as i32));
-        if old.tracking_id != INACTIVE_TRACKING_ID {
-            events.push(abs_event(
-                AbsoluteAxisType::ABS_MT_TRACKING_ID,
-                INACTIVE_TRACKING_ID,
-            ));
+        if identity_changed {
+            if old.tracking_id != INACTIVE_TRACKING_ID {
+                events.push(abs_event(
+                    AbsoluteAxisType::ABS_MT_TRACKING_ID,
+                    INACTIVE_TRACKING_ID,
+                ));
+            }
+            if new.tracking_id != INACTIVE_TRACKING_ID {
+                events.push(abs_event(
+                    AbsoluteAxisType::ABS_MT_TRACKING_ID,
+                    new.tracking_id,
+                ));
+            }
         }
-        if new.tracking_id != INACTIVE_TRACKING_ID {
-            events.push(abs_event(
-                AbsoluteAxisType::ABS_MT_TRACKING_ID,
-                new.tracking_id,
-            ));
+        if rebuild_position {
             events.push(abs_event(AbsoluteAxisType::ABS_MT_POSITION_X, new.x));
             events.push(abs_event(AbsoluteAxisType::ABS_MT_POSITION_Y, new.y));
         }
@@ -483,8 +525,9 @@ fn reconciliation_events(previous: &FrameState, refreshed: &FrameState) -> Vec<I
             i32::from(refreshed.contact),
         ));
     }
+    events.push(abs_event(AbsoluteAxisType::ABS_MT_SLOT, final_slot as i32));
     events.push(InputEvent::new(EventType::SYNCHRONIZATION, 0, 0));
-    events
+    Ok(events)
 }
 
 fn abs_event(axis: AbsoluteAxisType, value: i32) -> InputEvent {
@@ -584,6 +627,50 @@ impl FrameState {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct VirtualTypeB {
+        slots: Vec<SlotState>,
+        current_slot: Option<usize>,
+    }
+
+    impl VirtualTypeB {
+        fn from_state(state: &FrameState) -> Self {
+            Self {
+                slots: state.slots.clone(),
+                current_slot: state.current_slot,
+            }
+        }
+
+        fn apply(&mut self, events: &[InputEvent]) {
+            for event in events {
+                if event.event_type() != EventType::ABSOLUTE {
+                    continue;
+                }
+                let axis = AbsoluteAxisType(event.code());
+                if axis == AbsoluteAxisType::ABS_MT_SLOT {
+                    self.current_slot =
+                        Some(validated_runtime_slot(event.value(), self.slots.len()).unwrap());
+                    continue;
+                }
+                let slot = self
+                    .current_slot
+                    .expect("virtual device has a selected slot");
+                match axis {
+                    AbsoluteAxisType::ABS_MT_TRACKING_ID => {
+                        self.slots[slot].tracking_id = event.value();
+                    }
+                    AbsoluteAxisType::ABS_MT_POSITION_X => {
+                        self.slots[slot].x = event.value();
+                    }
+                    AbsoluteAxisType::ABS_MT_POSITION_Y => {
+                        self.slots[slot].y = event.value();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     fn state(slot_count: usize) -> FrameState {
         FrameState {
             slots: vec![SlotState::default(); slot_count],
@@ -663,7 +750,8 @@ mod tests {
         set_contact(&mut old, 1, 20, 700, 500);
         let mut new = state(2);
         set_contact(&mut new, 1, 31, 640, 480);
-        let events = reconciliation_events(&old, &new);
+        let events =
+            reconciliation_events(&old, &new, ReconciliationKind::LostSynchronization).unwrap();
         let semantics = events
             .iter()
             .map(|event| (event.event_type().0, event.code(), event.value()))
@@ -683,6 +771,127 @@ mod tests {
             AbsoluteAxisType::ABS_MT_POSITION_X.0,
             640
         )));
+    }
+
+    #[test]
+    fn reconciliation_restores_virtual_current_slot_for_following_positions() {
+        let mut old = state(2);
+        set_contact(&mut old, 0, 10, 100, 200);
+        old.current_slot = Some(0);
+        let mut refreshed = old.clone();
+        set_contact(&mut refreshed, 1, 20, 700, 500);
+        refreshed.current_slot = Some(0);
+
+        let events =
+            reconciliation_events(&old, &refreshed, ReconciliationKind::LostSynchronization)
+                .unwrap();
+        let restored_slot = events[events.len() - 2];
+        assert_eq!(restored_slot.event_type(), EventType::ABSOLUTE);
+        assert_eq!(restored_slot.code(), AbsoluteAxisType::ABS_MT_SLOT.0);
+        assert_eq!(restored_slot.value(), 0);
+        assert!(is_syn_report(events.last().unwrap()));
+
+        let mut virtual_device = VirtualTypeB::from_state(&old);
+        virtual_device.apply(&events);
+        virtual_device.apply(&[
+            abs_event(AbsoluteAxisType::ABS_MT_POSITION_X, 150),
+            abs_event(AbsoluteAxisType::ABS_MT_POSITION_Y, 250),
+        ]);
+        assert_eq!(virtual_device.current_slot, Some(0));
+        assert_eq!(
+            (virtual_device.slots[0].x, virtual_device.slots[0].y),
+            (150, 250)
+        );
+        assert_eq!(
+            (virtual_device.slots[1].x, virtual_device.slots[1].y),
+            (700, 500)
+        );
+    }
+
+    #[test]
+    fn lost_sync_rebuilds_changed_positions_for_surviving_identity() {
+        let mut old = state(2);
+        set_contact(&mut old, 1, 20, 700, 500);
+        let mut refreshed = old.clone();
+        refreshed.slots[1].x = 640;
+        refreshed.slots[1].y = 480;
+
+        let events =
+            reconciliation_events(&old, &refreshed, ReconciliationKind::LostSynchronization)
+                .unwrap();
+        let mut virtual_device = VirtualTypeB::from_state(&old);
+        virtual_device.apply(&events);
+
+        assert_eq!(virtual_device.slots[1].tracking_id, 20);
+        assert_eq!(
+            (virtual_device.slots[1].x, virtual_device.slots[1].y),
+            (640, 480)
+        );
+    }
+
+    #[test]
+    fn lost_sync_rebuilds_unchanged_positions_for_every_active_slot() {
+        let mut old = state(3);
+        set_contact(&mut old, 0, 10, 100, 200);
+        set_contact(&mut old, 2, 30, 700, 500);
+        old.current_slot = Some(1);
+        let refreshed = old.clone();
+
+        let events =
+            reconciliation_events(&old, &refreshed, ReconciliationKind::LostSynchronization)
+                .unwrap();
+        let positions = events
+            .iter()
+            .filter(|event| {
+                event.event_type() == EventType::ABSOLUTE
+                    && matches!(
+                        AbsoluteAxisType(event.code()),
+                        AbsoluteAxisType::ABS_MT_POSITION_X | AbsoluteAxisType::ABS_MT_POSITION_Y
+                    )
+            })
+            .count();
+
+        assert_eq!(positions, 4);
+        let restored_slot = events[events.len() - 2];
+        assert_eq!(restored_slot.event_type(), EventType::ABSOLUTE);
+        assert_eq!(restored_slot.code(), AbsoluteAxisType::ABS_MT_SLOT.0);
+        assert_eq!(restored_slot.value(), 1);
+    }
+
+    #[test]
+    fn lost_sync_rebuilds_changed_and_surviving_identities_together() {
+        let mut old = state(3);
+        set_contact(&mut old, 0, 10, 100, 200);
+        set_contact(&mut old, 2, 30, 700, 500);
+        let mut refreshed = old.clone();
+        refreshed.slots[0] = SlotState {
+            tracking_id: 11,
+            x: 120,
+            y: 220,
+        };
+        refreshed.slots[2].x = 720;
+        refreshed.slots[2].y = 520;
+        refreshed.current_slot = Some(2);
+
+        let events =
+            reconciliation_events(&old, &refreshed, ReconciliationKind::LostSynchronization)
+                .unwrap();
+        let mut virtual_device = VirtualTypeB::from_state(&old);
+        virtual_device.apply(&events);
+
+        assert_eq!(virtual_device.slots, refreshed.slots);
+        assert_eq!(virtual_device.current_slot, refreshed.current_slot);
+    }
+
+    #[test]
+    fn reconciliation_rejects_missing_refreshed_current_slot() {
+        let old = state(2);
+        let mut refreshed = old.clone();
+        refreshed.current_slot = None;
+        assert!(
+            reconciliation_events(&old, &refreshed, ReconciliationKind::LostSynchronization)
+                .is_err()
+        );
     }
 
     #[test]
