@@ -117,7 +117,7 @@ journalctl --user -u letsnote-wheelpad -f
 
 - **`WheelUnderCursor` は設定不可。** Wayland ではコンポジタがフォーカス先サーフェスにイベントを配るため、ユーザランドからの上書きはできません。
 - **縦方向の円スクロールは Synaptics TM3562-3 と CF-SZ6 SYN0502 で実機検証済み。** 他のタッチパッドでも `device_name_regex` と座標補正を設定すれば動く可能性はありますが、動作保証はしません。
-- **入力プロキシの復旧処理はまだ実機検証していません。** 接触中の起動、signal shutdown、`SYN_DROPPED` 復旧、ボタンを押したままのスクロールは、物理タッチパッド・uinput・libinput を通した end-to-end 試験が必要です。
+- **入力プロキシの復旧処理はまだ実機検証していません。** contactまたはbuttonがactiveな起動時の待機・grab retry、signal shutdown、`SYN_DROPPED` 復旧、ボタンを押したままのスクロールは、物理タッチパッド・uinput・libinput を通した end-to-end 試験が必要です。
 - **Excel 用矢印キーフォールバックは削除。** 現代の Excel は横ホイールイベントをネイティブで処理するため、Windows 版のハックは不要です。
 - **コースティング/慣性スクロールなし。** Windows 版 WheelPad に合わせています。xf86 にはありますが、本プロジェクトでは実装しません。
 
@@ -125,7 +125,9 @@ journalctl --user -u letsnote-wheelpad -f
 
 入力元として受け付けるのは、`ABS_MT_SLOT`、`ABS_MT_TRACKING_ID`、`ABS_MT_POSITION_X/Y`、`BTN_TOUCH` を公開する物理 Type B multitouch device だけです。自動探索では、未対応候補を除外してから同名候補の曖昧性を判定します。再帰的に自分の uinput 出力を選ばないよう、すべての `BUS_VIRTUAL` device に加え、letsnote-wheelpad 固有の名前または input ID を持つ device を拒否します。
 
-起動時には公開された slot 範囲を読み、`EVIOCGMTSLOTS` で全 slot の tracking ID と座標を snapshot し、gesture input state と routing state の両方を初期化します。evdev stream は raw mode で読み、`SYN_DROPPED` を検出したら slot の tracking ID と座標を再取得し、変化した contact の基本 lifecycle を同期します。ただし、`SYN_DROPPED` 後にすべての補助 key/ABS state を仮想 device 上へ完全再構築する処理は未実装です。
+起動時には、物理deviceをungrabbedのまま仮想deviceを作成します。MT tracking ID、`BTN_TOUCH`、物理touchpad buttonのいずれかがactiveなら、既存consumerがそのlifecycleを完了できるよう待機します。quiescent snapshotを確認してからgrabし、直ちにgrab前eventをdrainしてstateを再照会します。race windowでinputがactiveになっていればungrabして再試行します。確認済みのquiescent snapshotからgesture/routing stateを初期化し、その後にだけsystemdへ`READY=1`を送ります。恒久grab前からactiveだったcontactやbuttonをproxyへ途中から引き継ぐことはしません。
+
+evdev streamはraw modeで読み、`SYN_DROPPED`を検出したら全slotのtracking IDと位置を再取得します。再構築streamは、変化したまたはactiveな各slotを選択し、必要なtracking終了/開始eventを出し、identityが変わっていないactive slotを含めて最新X/Yを出し、最後に物理deviceのrefreshed current slotを再選択して`SYN_REPORT`を出します。Scrolling中の捕捉contact X/Yはroutingで抑止できますが、非捕捉contactの再構築位置は転送します。ただし、`SYN_DROPPED`後にすべての補助key/ABS stateを仮想device上へ完全再構築する処理は未実装です。
 
 以前の無条件な 5 秒 scrolling watchdog は削除しました。Scrolling 中だけ poll loop が 1 秒ごとに物理 tracking ID を確認します。捕捉中の `(slot, tracking_id)` が存在する限り、指が静止していても session を維持します。その identity が消えた場合は、同期した lift を通常の FSM へ渡して session を終了します。同期 I/O が失敗した場合は fatal error とし、grab を解放して非ゼロ終了します。
 

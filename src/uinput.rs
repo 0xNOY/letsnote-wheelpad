@@ -6,11 +6,11 @@
 //    and REL_HWHEEL{,_HI_RES}. This is where the scroll ticks come out.
 //
 // 2. UinputTouchpad — virtual touchpad that mirrors the physical pad's
-//    capabilities. We grab the physical pad permanently at startup and
-//    forward its events through this device, suppressing position
-//    updates while the FSM is in Scrolling state. Libinput attaches to
-//    the virtual pad only, so it can never have stale state from a
-//    transient grab/ungrab cycle.
+//    capabilities. After the physical pad is confirmed quiescent, we
+//    hold its grab and forward events through this device, suppressing
+//    captured-contact position updates while the FSM is Scrolling.
+//    Startup never transfers an already-active physical lifecycle
+//    halfway into this virtual device.
 
 use std::io;
 use std::path::Path;
