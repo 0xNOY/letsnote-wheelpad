@@ -16,9 +16,10 @@ use std::io;
 use std::path::Path;
 
 use evdev::{
+    raw_stream::RawDevice,
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AbsInfo, AttributeSet, BusType, Device, EventType, InputEvent, InputId, PropType,
-    RelativeAxisType, UinputAbsSetup,
+    AbsInfo, AttributeSet, BusType, EventType, InputEvent, InputId, PropType, RelativeAxisType,
+    UinputAbsSetup,
 };
 use tracing::warn;
 
@@ -120,7 +121,7 @@ impl UinputTouchpad {
     /// name (with a suffix) so libinput's name-regex quirks keep
     /// matching, but uses a distinct vendor/product so libinput
     /// classifies it as a separate device.
-    pub fn create_from_physical(physical: &Device) -> Result<Self> {
+    pub fn create_from_physical(physical: &RawDevice) -> Result<Self> {
         if !Path::new("/dev/uinput").exists() {
             return Err(Error::UinputMissing);
         }

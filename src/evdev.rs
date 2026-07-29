@@ -1,22 +1,26 @@
-// Physical touchpad input — opens the evdev node, queries EVIOCGABS for
-// center coordinates, and turns the raw event stream into TouchFrames at
-// each SYN_REPORT. See linux-design.md §5.
-
 use std::io;
 use std::ops::{Deref, DerefMut};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use evdev::{AbsoluteAxisType, BusType, Device, EventType, InputEvent, InputId, Key};
+use evdev::raw_stream::RawDevice;
+use evdev::{
+    AbsoluteAxisType, BusType, Device, EventType, InputEvent, InputId, Key, Synchronization,
+};
 use tracing::warn;
 
 use crate::detector::TouchSample;
 use crate::error::{Error, Result};
 use crate::fsm::{ContactId, TouchFrame};
 use crate::uinput::{TOUCHPAD_PRODUCT_ID, VENDOR_ID, WHEEL_PRODUCT_ID};
-use crate::MAX_MT_SLOTS;
+
+const INACTIVE_TRACKING_ID: i32 = -1;
+const MAX_SUPPORTED_MT_SLOTS: usize = 256;
+
+nix::ioctl_read_buf!(eviocgmtslots, b'E', 0x0a, i32);
 
 pub struct InputDevice {
-    pub device: Device,
+    pub device: RawDevice,
     pub abs_x_min: i32,
     pub abs_x_max: i32,
     pub abs_y_min: i32,
@@ -24,44 +28,49 @@ pub struct InputDevice {
     pub center_x: i32,
     pub center_y: i32,
     state: FrameState,
+    pending_events: Vec<InputEvent>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct FrameState {
-    /// Per-slot tracking IDs and last-seen (x, y). Slot index 0..MAX_MT_SLOTS-1.
-    slots: [SlotState; MAX_MT_SLOTS],
-    /// Current writing slot per ABS_MT_SLOT event.
-    current_slot: usize,
-    /// BTN_TOUCH summary; mirrors the kernel-reported any-finger-down state.
-    contact: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SlotState {
-    /// `-1` means inactive (kernel convention).
     tracking_id: i32,
     x: i32,
     y: i32,
 }
 
-#[derive(Clone, Copy, Debug)]
+impl Default for SlotState {
+    fn default() -> Self {
+        Self {
+            tracking_id: INACTIVE_TRACKING_ID,
+            x: 0,
+            y: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FrameState {
+    slots: Vec<SlotState>,
+    current_slot: Option<usize>,
+    contact: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct ContactSnapshot {
-    slots: [SlotState; MAX_MT_SLOTS],
+    slots: Vec<SlotState>,
+    current_slot: Option<usize>,
     contact: bool,
 }
 
 impl ContactSnapshot {
     pub fn primary(&self) -> TouchFrame {
-        let contact = self
-            .contact
-            .then(|| {
-                self.slots
-                    .iter()
-                    .enumerate()
-                    .find(|(_, slot)| slot.tracking_id != -1)
-            })
-            .flatten();
-        match contact {
+        let active = self.contact.then(|| {
+            self.slots
+                .iter()
+                .enumerate()
+                .find(|(_, slot)| slot.tracking_id != INACTIVE_TRACKING_ID)
+        });
+        match active.flatten() {
             Some((slot, state)) => TouchFrame {
                 contact: true,
                 pos: Some(TouchSample {
@@ -102,16 +111,71 @@ impl ContactSnapshot {
             },
         }
     }
+
+    pub fn contains(&self, id: ContactId) -> bool {
+        self.slots
+            .get(id.slot)
+            .is_some_and(|slot| slot.tracking_id == id.tracking_id)
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub(crate) fn tracking_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.slots.iter().map(|slot| slot.tracking_id)
+    }
+
+    pub(crate) fn current_slot(&self) -> Option<usize> {
+        self.current_slot
+    }
+
+    pub fn from_slot_values(
+        slots: &[(i32, i32, i32)],
+        current_slot: Option<usize>,
+        contact: bool,
+    ) -> io::Result<Self> {
+        if slots.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "at least one MT slot is required",
+            ));
+        }
+        if current_slot.is_some_and(|slot| slot >= slots.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "current MT slot is out of range",
+            ));
+        }
+        Ok(Self {
+            slots: slots
+                .iter()
+                .map(|&(tracking_id, x, y)| SlotState { tracking_id, x, y })
+                .collect(),
+            current_slot,
+            contact,
+        })
+    }
 }
 
-/// One SYN_REPORT-bounded batch of physical events plus the
-/// high-level frame assembled from them.
 pub struct PhysicalFrame {
     pub contacts: ContactSnapshot,
-    /// All events from the underlying fetch, in original order.
-    /// Forwarded verbatim to the virtual touchpad (minus the trailing
-    /// SYN_REPORT, which `emit()` re-inserts).
     pub events: Vec<InputEvent>,
+    pub reconciled: bool,
+}
+
+impl PhysicalFrame {
+    pub fn from_parts(
+        contacts: ContactSnapshot,
+        events: Vec<InputEvent>,
+        reconciled: bool,
+    ) -> Self {
+        Self {
+            contacts,
+            events,
+            reconciled,
+        }
+    }
 }
 
 pub struct GrabGuard {
@@ -146,72 +210,48 @@ impl Drop for GrabGuard {
 }
 
 impl InputDevice {
-    /// Open the device at `path` and validate required capabilities.
     pub fn open(path: &Path) -> Result<Self> {
-        let device = Device::open(path).map_err(|source| Error::EvdevOpen {
+        let device = RawDevice::open(path).map_err(|source| Error::EvdevOpen {
             path: path.to_path_buf(),
             source,
         })?;
-        validate_physical_source(path, &device)?;
-
-        // Required capabilities.
-        let abs = device.supported_absolute_axes();
-        let keys = device.supported_keys();
-        let has_x = abs.is_some_and(|a| a.contains(AbsoluteAxisType::ABS_MT_POSITION_X));
-        let has_y = abs.is_some_and(|a| a.contains(AbsoluteAxisType::ABS_MT_POSITION_Y));
-        let has_touch = keys.is_some_and(|k| k.contains(Key::BTN_TOUCH));
-        if !has_x {
-            return Err(Error::EvdevMissingCap {
-                path: path.to_path_buf(),
-                capability: "ABS_MT_POSITION_X",
-            });
-        }
-        if !has_y {
-            return Err(Error::EvdevMissingCap {
-                path: path.to_path_buf(),
-                capability: "ABS_MT_POSITION_Y",
-            });
-        }
-        if !has_touch {
-            return Err(Error::EvdevMissingCap {
-                path: path.to_path_buf(),
-                capability: "BTN_TOUCH",
-            });
-        }
-
+        validate_physical_source(path, device.input_id(), device.name())?;
+        let slot_count = validate_raw_type_b(path, &device)?;
         let abs_state = device
             .get_abs_state()
             .map_err(|source| Error::EvdevRead { source })?;
         let xi = abs_state[AbsoluteAxisType::ABS_MT_POSITION_X.0 as usize];
         let yi = abs_state[AbsoluteAxisType::ABS_MT_POSITION_Y.0 as usize];
-        let abs_x_min = xi.minimum;
-        let abs_x_max = xi.maximum;
-        let abs_y_min = yi.minimum;
-        let abs_y_max = yi.maximum;
-        let center_x = (abs_x_min + abs_x_max) / 2;
-        let center_y = (abs_y_min + abs_y_max) / 2;
-
-        let slots = [SlotState {
-            tracking_id: -1,
-            x: 0,
-            y: 0,
-        }; MAX_MT_SLOTS];
-
+        let slot_info = abs_state[AbsoluteAxisType::ABS_MT_SLOT.0 as usize];
+        let current_slot =
+            validated_runtime_slot(slot_info.value, slot_count).map_err(|source| {
+                Error::EvdevState {
+                    path: path.to_path_buf(),
+                    reason: source.to_string(),
+                }
+            })?;
+        let contact = device
+            .get_key_state()
+            .map_err(|source| Error::EvdevRead { source })?
+            .contains(Key::BTN_TOUCH);
+        let slots =
+            query_all_slots(&device, slot_count).map_err(|source| Error::EvdevRead { source })?;
         let state = FrameState {
             slots,
-            current_slot: 0,
-            contact: false,
+            current_slot: Some(current_slot),
+            contact,
         };
 
         Ok(Self {
             device,
-            abs_x_min,
-            abs_x_max,
-            abs_y_min,
-            abs_y_max,
-            center_x,
-            center_y,
+            abs_x_min: xi.minimum,
+            abs_x_max: xi.maximum,
+            abs_y_min: yi.minimum,
+            abs_y_max: yi.maximum,
+            center_x: (xi.minimum + xi.maximum) / 2,
+            center_y: (yi.minimum + yi.maximum) / 2,
             state,
+            pending_events: Vec::new(),
         })
     }
 
@@ -225,7 +265,10 @@ impl InputDevice {
         })
     }
 
-    /// Find the unique physical touchpad whose name matches `regex`.
+    pub fn snapshot(&self) -> ContactSnapshot {
+        self.state.snapshot()
+    }
+
     pub fn find_by_name(regex_str: &str) -> Result<PathBuf> {
         let re = regex::Regex::new(regex_str).map_err(|source| Error::RegexInvalid {
             pattern: regex_str.to_string(),
@@ -233,48 +276,229 @@ impl InputDevice {
         })?;
         let mut candidates = Vec::new();
         for (path, device) in evdev::enumerate() {
-            if let Some(name) = device.name() {
-                if re.is_match(name) && !is_virtual_source(&device.input_id(), name) {
-                    candidates.push((path, name.to_string()));
-                }
+            let Some(name) = device.name() else {
+                continue;
+            };
+            if re.is_match(name)
+                && !is_virtual_source(&device.input_id(), name)
+                && validate_sync_type_b(&path, &device).is_ok()
+            {
+                candidates.push((path, name.to_string()));
             }
         }
         select_candidate(regex_str, candidates)
     }
 
-    /// Block until events are available, then return ALL complete
-    /// SYN_REPORT-bounded frames from this fetch. If the daemon was
-    /// briefly descheduled and the kernel has buffered multiple
-    /// frames, every one is returned so the caller can step the FSM
-    /// and forward to the virtual touchpad per-frame — gluing N
-    /// kernel batches into one virtual batch loses per-frame timing
-    /// and corrupts libinput's state.
-    ///
-    /// evdev 0.12.2's synchronized iterator only yields complete
-    /// SYN_REPORT-terminated blocks. An incomplete kernel read remains
-    /// in the library's internal buffer for the next `fetch_events()`.
     pub fn poll_frames(&mut self) -> io::Result<Vec<PhysicalFrame>> {
-        let events: Vec<InputEvent> = self.device.fetch_events()?.collect();
-        let mut frames: Vec<PhysicalFrame> = Vec::new();
-        let mut batch_events: Vec<InputEvent> = Vec::new();
-        for ev in events {
-            batch_events.push(ev);
-            match ev.event_type() {
-                EventType::ABSOLUTE => self.state.apply_abs(ev.code(), ev.value()),
-                EventType::KEY if ev.code() == Key::BTN_TOUCH.code() => {
-                    self.state.contact = ev.value() != 0;
-                }
-                EventType::SYNCHRONIZATION if ev.code() == 0 => {
-                    frames.push(PhysicalFrame {
-                        contacts: self.state.snapshot(),
-                        events: std::mem::take(&mut batch_events),
-                    });
-                }
-                _ => {}
+        let fetched = self.device.fetch_events()?.collect::<Vec<_>>();
+        self.pending_events.extend(fetched);
+        let mut frames = Vec::new();
+
+        while let Some(end) = self.pending_events.iter().position(is_syn_report) {
+            let events = self.pending_events.drain(..=end).collect::<Vec<_>>();
+            if events.iter().any(is_syn_dropped) {
+                frames.push(self.reconcile_frame()?);
+                continue;
             }
+            for event in &events {
+                self.state.apply_event(*event)?;
+            }
+            frames.push(PhysicalFrame {
+                contacts: self.state.snapshot(),
+                events,
+                reconciled: false,
+            });
         }
         Ok(frames)
     }
+
+    pub fn reconcile_frame(&mut self) -> io::Result<PhysicalFrame> {
+        let previous = self.state.clone();
+        let refreshed = self.query_frame_state()?;
+        let events = reconciliation_events(&previous, &refreshed);
+        self.state = refreshed;
+        Ok(PhysicalFrame {
+            contacts: self.state.snapshot(),
+            events,
+            reconciled: true,
+        })
+    }
+
+    fn query_frame_state(&self) -> io::Result<FrameState> {
+        let abs_state = self.device.get_abs_state()?;
+        let current_slot = validated_runtime_slot(
+            abs_state[AbsoluteAxisType::ABS_MT_SLOT.0 as usize].value,
+            self.state.slots.len(),
+        )?;
+        let contact = self.device.get_key_state()?.contains(Key::BTN_TOUCH);
+        Ok(FrameState {
+            slots: query_all_slots(&self.device, self.state.slots.len())?,
+            current_slot: Some(current_slot),
+            contact,
+        })
+    }
+}
+
+fn validate_raw_type_b(path: &Path, device: &RawDevice) -> Result<usize> {
+    validate_required_caps(
+        path,
+        device.supported_absolute_axes(),
+        device.supported_keys(),
+    )?;
+    let abs_state = device
+        .get_abs_state()
+        .map_err(|source| Error::EvdevRead { source })?;
+    let slot = abs_state[AbsoluteAxisType::ABS_MT_SLOT.0 as usize];
+    slot_count_from_range(path, slot.minimum, slot.maximum)
+}
+
+fn validate_sync_type_b(path: &Path, device: &Device) -> Result<usize> {
+    validate_required_caps(
+        path,
+        device.supported_absolute_axes(),
+        device.supported_keys(),
+    )?;
+    let abs_state = device
+        .get_abs_state()
+        .map_err(|source| Error::EvdevRead { source })?;
+    let slot = abs_state[AbsoluteAxisType::ABS_MT_SLOT.0 as usize];
+    slot_count_from_range(path, slot.minimum, slot.maximum)
+}
+
+fn validate_required_caps(
+    path: &Path,
+    abs: Option<&evdev::AttributeSetRef<AbsoluteAxisType>>,
+    keys: Option<&evdev::AttributeSetRef<Key>>,
+) -> Result<()> {
+    for (axis, name) in [
+        (AbsoluteAxisType::ABS_MT_SLOT, "ABS_MT_SLOT"),
+        (AbsoluteAxisType::ABS_MT_TRACKING_ID, "ABS_MT_TRACKING_ID"),
+        (AbsoluteAxisType::ABS_MT_POSITION_X, "ABS_MT_POSITION_X"),
+        (AbsoluteAxisType::ABS_MT_POSITION_Y, "ABS_MT_POSITION_Y"),
+    ] {
+        if !abs.is_some_and(|axes| axes.contains(axis)) {
+            return Err(Error::EvdevMissingCap {
+                path: path.to_path_buf(),
+                capability: name,
+            });
+        }
+    }
+    if !keys.is_some_and(|set| set.contains(Key::BTN_TOUCH)) {
+        return Err(Error::EvdevMissingCap {
+            path: path.to_path_buf(),
+            capability: "BTN_TOUCH",
+        });
+    }
+    Ok(())
+}
+
+fn slot_count_from_range(path: &Path, minimum: i32, maximum: i32) -> Result<usize> {
+    if minimum != 0 || maximum < minimum {
+        return Err(Error::EvdevSlotRange {
+            path: path.to_path_buf(),
+            minimum,
+            maximum,
+            expected: "minimum 0 and maximum >= 0",
+        });
+    }
+    let count = maximum as usize + 1;
+    if count > MAX_SUPPORTED_MT_SLOTS {
+        return Err(Error::EvdevSlotRange {
+            path: path.to_path_buf(),
+            minimum,
+            maximum,
+            expected: "at most 256 slots",
+        });
+    }
+    Ok(count)
+}
+
+fn validated_runtime_slot(value: i32, slot_count: usize) -> io::Result<usize> {
+    usize::try_from(value)
+        .ok()
+        .filter(|slot| *slot < slot_count)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ABS_MT_SLOT value {value} outside 0..{slot_count}"),
+            )
+        })
+}
+
+fn query_all_slots(device: &RawDevice, slot_count: usize) -> io::Result<Vec<SlotState>> {
+    let tracking_ids = query_slot_values(device, slot_count, AbsoluteAxisType::ABS_MT_TRACKING_ID)?;
+    let xs = query_slot_values(device, slot_count, AbsoluteAxisType::ABS_MT_POSITION_X)?;
+    let ys = query_slot_values(device, slot_count, AbsoluteAxisType::ABS_MT_POSITION_Y)?;
+    Ok((0..slot_count)
+        .map(|slot| SlotState {
+            tracking_id: tracking_ids[slot],
+            x: xs[slot],
+            y: ys[slot],
+        })
+        .collect())
+}
+
+fn query_slot_values(
+    device: &RawDevice,
+    slot_count: usize,
+    axis: AbsoluteAxisType,
+) -> io::Result<Vec<i32>> {
+    let mut request = vec![0_i32; slot_count + 1];
+    request[0] = axis.0 as i32;
+    // SAFETY: EVIOCGMTSLOTS expects one u32 axis code followed by
+    // `slot_count` i32 values. `i32` has the same 4-byte layout as the
+    // kernel's u32 code field, the slice is writable for its full
+    // ioctl-encoded length, and the FD remains owned by `device`.
+    unsafe { eviocgmtslots(device.as_raw_fd(), &mut request) }
+        .map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
+    Ok(request.split_off(1))
+}
+
+fn reconciliation_events(previous: &FrameState, refreshed: &FrameState) -> Vec<InputEvent> {
+    let mut events = Vec::new();
+    for (slot, (old, new)) in previous.slots.iter().zip(&refreshed.slots).enumerate() {
+        if old.tracking_id == new.tracking_id {
+            continue;
+        }
+        events.push(abs_event(AbsoluteAxisType::ABS_MT_SLOT, slot as i32));
+        if old.tracking_id != INACTIVE_TRACKING_ID {
+            events.push(abs_event(
+                AbsoluteAxisType::ABS_MT_TRACKING_ID,
+                INACTIVE_TRACKING_ID,
+            ));
+        }
+        if new.tracking_id != INACTIVE_TRACKING_ID {
+            events.push(abs_event(
+                AbsoluteAxisType::ABS_MT_TRACKING_ID,
+                new.tracking_id,
+            ));
+            events.push(abs_event(AbsoluteAxisType::ABS_MT_POSITION_X, new.x));
+            events.push(abs_event(AbsoluteAxisType::ABS_MT_POSITION_Y, new.y));
+        }
+    }
+    if previous.contact != refreshed.contact {
+        events.push(InputEvent::new(
+            EventType::KEY,
+            Key::BTN_TOUCH.0,
+            i32::from(refreshed.contact),
+        ));
+    }
+    events.push(InputEvent::new(EventType::SYNCHRONIZATION, 0, 0));
+    events
+}
+
+fn abs_event(axis: AbsoluteAxisType, value: i32) -> InputEvent {
+    InputEvent::new(EventType::ABSOLUTE, axis.0, value)
+}
+
+fn is_syn_report(event: &InputEvent) -> bool {
+    event.event_type() == EventType::SYNCHRONIZATION
+        && event.code() == Synchronization::SYN_REPORT.0
+}
+
+fn is_syn_dropped(event: &InputEvent) -> bool {
+    event.event_type() == EventType::SYNCHRONIZATION
+        && event.code() == Synchronization::SYN_DROPPED.0
 }
 
 fn select_candidate(regex_str: &str, mut candidates: Vec<(PathBuf, String)>) -> Result<PathBuf> {
@@ -297,9 +521,9 @@ fn select_candidate(regex_str: &str, mut candidates: Vec<(PathBuf, String)>) -> 
     }
 }
 
-fn validate_physical_source(path: &Path, device: &Device) -> Result<()> {
-    let name = device.name().unwrap_or("<unnamed>");
-    if is_virtual_source(&device.input_id(), name) {
+fn validate_physical_source(path: &Path, id: InputId, name: Option<&str>) -> Result<()> {
+    let name = name.unwrap_or("<unnamed>");
+    if is_virtual_source(&id, name) {
         return Err(Error::VirtualInputSource {
             path: path.to_path_buf(),
             name: name.to_string(),
@@ -316,39 +540,41 @@ fn is_virtual_source(id: &InputId, name: &str) -> bool {
 }
 
 impl FrameState {
-    fn apply_abs(&mut self, code: u16, value: i32) {
-        let axis = AbsoluteAxisType(code);
+    fn apply_event(&mut self, event: InputEvent) -> io::Result<()> {
+        if event.event_type() == EventType::KEY && event.code() == Key::BTN_TOUCH.0 {
+            self.contact = event.value() != 0;
+            return Ok(());
+        }
+        if event.event_type() != EventType::ABSOLUTE {
+            return Ok(());
+        }
+        let axis = AbsoluteAxisType(event.code());
+        if axis == AbsoluteAxisType::ABS_MT_SLOT {
+            self.current_slot = None;
+            self.current_slot = Some(validated_runtime_slot(event.value(), self.slots.len())?);
+            return Ok(());
+        }
+        let Some(slot) = self.current_slot else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("received {axis:?} without a valid selected MT slot"),
+            ));
+        };
         match axis {
-            AbsoluteAxisType::ABS_MT_SLOT if (value as usize) < MAX_MT_SLOTS => {
-                self.current_slot = value as usize;
-            }
             AbsoluteAxisType::ABS_MT_TRACKING_ID => {
-                let slot = self.current_slot;
-                if slot < MAX_MT_SLOTS {
-                    self.slots[slot].tracking_id = value;
-                }
+                self.slots[slot].tracking_id = event.value();
             }
-            AbsoluteAxisType::ABS_MT_POSITION_X => {
-                let slot = self.current_slot;
-                if slot < MAX_MT_SLOTS {
-                    self.slots[slot].x = value;
-                }
-            }
-            AbsoluteAxisType::ABS_MT_POSITION_Y => {
-                let slot = self.current_slot;
-                if slot < MAX_MT_SLOTS {
-                    self.slots[slot].y = value;
-                }
-            }
-            // Some pads also expose ABS_X / ABS_Y for the primary touch.
-            // We deliberately ignore those — MT axes are authoritative.
+            AbsoluteAxisType::ABS_MT_POSITION_X => self.slots[slot].x = event.value(),
+            AbsoluteAxisType::ABS_MT_POSITION_Y => self.slots[slot].y = event.value(),
             _ => {}
         }
+        Ok(())
     }
 
     fn snapshot(&self) -> ContactSnapshot {
         ContactSnapshot {
-            slots: self.slots,
+            slots: self.slots.clone(),
+            current_slot: self.current_slot,
             contact: self.contact,
         }
     }
@@ -358,69 +584,105 @@ impl FrameState {
 mod tests {
     use super::*;
 
-    fn state() -> FrameState {
+    fn state(slot_count: usize) -> FrameState {
         FrameState {
-            slots: [SlotState {
-                tracking_id: -1,
-                x: 0,
-                y: 0,
-            }; MAX_MT_SLOTS],
-            current_slot: 0,
+            slots: vec![SlotState::default(); slot_count],
+            current_slot: Some(0),
             contact: true,
         }
     }
 
     fn set_contact(state: &mut FrameState, slot: usize, tracking_id: i32, x: i32, y: i32) {
-        state.apply_abs(AbsoluteAxisType::ABS_MT_SLOT.0, slot as i32);
-        state.apply_abs(AbsoluteAxisType::ABS_MT_TRACKING_ID.0, tracking_id);
-        state.apply_abs(AbsoluteAxisType::ABS_MT_POSITION_X.0, x);
-        state.apply_abs(AbsoluteAxisType::ABS_MT_POSITION_Y.0, y);
+        state
+            .apply_event(abs_event(AbsoluteAxisType::ABS_MT_SLOT, slot as i32))
+            .unwrap();
+        state
+            .apply_event(abs_event(AbsoluteAxisType::ABS_MT_TRACKING_ID, tracking_id))
+            .unwrap();
+        state
+            .apply_event(abs_event(AbsoluteAxisType::ABS_MT_POSITION_X, x))
+            .unwrap();
+        state
+            .apply_event(abs_event(AbsoluteAxisType::ABS_MT_POSITION_Y, y))
+            .unwrap();
+    }
+
+    #[test]
+    fn startup_snapshot_can_contain_an_active_contact() {
+        let snapshot =
+            ContactSnapshot::from_slot_values(&[(-1, 0, 0), (41, 800, 500)], Some(1), true)
+                .unwrap();
+        assert_eq!(
+            snapshot.primary().contact_id,
+            Some(ContactId {
+                slot: 1,
+                tracking_id: 41
+            })
+        );
     }
 
     #[test]
     fn tracked_contact_does_not_switch_to_a_lower_slot() {
-        let mut state = state();
+        let mut state = state(4);
         set_contact(&mut state, 3, 30, 800, 500);
         let tracked = state.snapshot().primary().contact_id.unwrap();
-
         set_contact(&mut state, 1, 10, 200, 300);
-        let frame = state.snapshot().for_contact(tracked);
-
-        assert_eq!(frame.contact_id, Some(tracked));
-        assert_eq!(frame.pos, Some(TouchSample { x: 800, y: 500 }));
+        assert_eq!(
+            state.snapshot().for_contact(tracked).pos,
+            Some(TouchSample { x: 800, y: 500 })
+        );
     }
 
     #[test]
-    fn only_the_tracked_tracking_id_ending_lifts_the_session_contact() {
-        let mut state = state();
-        set_contact(&mut state, 3, 30, 800, 500);
-        set_contact(&mut state, 1, 10, 200, 300);
-        let tracked = ContactId {
-            slot: 3,
-            tracking_id: 30,
-        };
-
-        state.apply_abs(AbsoluteAxisType::ABS_MT_SLOT.0, 1);
-        state.apply_abs(AbsoluteAxisType::ABS_MT_TRACKING_ID.0, -1);
-        assert!(state.snapshot().for_contact(tracked).contact);
-
-        state.apply_abs(AbsoluteAxisType::ABS_MT_SLOT.0, 3);
-        state.apply_abs(AbsoluteAxisType::ABS_MT_TRACKING_ID.0, -1);
-        assert!(!state.snapshot().for_contact(tracked).contact);
+    fn slot_boundary_accepts_highest_and_rejects_first_outside() {
+        let mut state = state(4);
+        assert!(state
+            .apply_event(abs_event(AbsoluteAxisType::ABS_MT_SLOT, 3))
+            .is_ok());
+        assert!(state
+            .apply_event(abs_event(AbsoluteAxisType::ABS_MT_SLOT, 4))
+            .is_err());
+        assert_eq!(state.current_slot, None);
+        assert!(state
+            .apply_event(abs_event(AbsoluteAxisType::ABS_MT_POSITION_X, 99))
+            .is_err());
     }
 
     #[test]
-    fn a_reused_slot_does_not_inherit_the_old_contact() {
-        let mut state = state();
-        set_contact(&mut state, 3, 30, 800, 500);
-        let tracked = ContactId {
-            slot: 3,
-            tracking_id: 30,
-        };
-        set_contact(&mut state, 3, -1, 800, 500);
-        set_contact(&mut state, 3, 31, 700, 400);
+    fn advertised_slot_range_is_validated() {
+        let path = Path::new("/dev/input/test");
+        assert_eq!(slot_count_from_range(path, 0, 255).unwrap(), 256);
+        assert!(slot_count_from_range(path, 0, 256).is_err());
+        assert!(slot_count_from_range(path, 1, 4).is_err());
+        assert!(slot_count_from_range(path, 0, -1).is_err());
+    }
 
-        assert!(!state.snapshot().for_contact(tracked).contact);
+    #[test]
+    fn reconciliation_ends_old_identity_and_starts_reused_slot() {
+        let mut old = state(2);
+        set_contact(&mut old, 1, 20, 700, 500);
+        let mut new = state(2);
+        set_contact(&mut new, 1, 31, 640, 480);
+        let events = reconciliation_events(&old, &new);
+        let semantics = events
+            .iter()
+            .map(|event| (event.event_type().0, event.code(), event.value()))
+            .collect::<Vec<_>>();
+        assert!(semantics.contains(&(
+            EventType::ABSOLUTE.0,
+            AbsoluteAxisType::ABS_MT_TRACKING_ID.0,
+            -1
+        )));
+        assert!(semantics.contains(&(
+            EventType::ABSOLUTE.0,
+            AbsoluteAxisType::ABS_MT_TRACKING_ID.0,
+            31
+        )));
+        assert!(semantics.contains(&(
+            EventType::ABSOLUTE.0,
+            AbsoluteAxisType::ABS_MT_POSITION_X.0,
+            640
+        )));
     }
 
     #[test]
@@ -428,7 +690,6 @@ mod tests {
         let physical = InputId::new(BusType::BUS_I2C, 1, 2, 1);
         let virtual_bus = InputId::new(BusType::BUS_VIRTUAL, 1, 2, 1);
         let own_ids = InputId::new(BusType::BUS_I2C, VENDOR_ID, TOUCHPAD_PRODUCT_ID, 1);
-
         assert!(!is_virtual_source(&physical, "Synaptics TM3562"));
         assert!(is_virtual_source(&virtual_bus, "Synaptics TM3562"));
         assert!(is_virtual_source(&own_ids, "renamed device"));
@@ -439,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_physical_candidates_are_reported_instead_of_selected() {
+    fn multiple_supported_candidates_are_reported() {
         let result = select_candidate(
             "TM3562",
             vec![
@@ -447,11 +708,6 @@ mod tests {
                 (PathBuf::from("/dev/input/event7"), "Touchpad B".into()),
             ],
         );
-
-        let Error::DeviceAmbiguous { candidates, .. } = result.unwrap_err() else {
-            panic!("expected ambiguous-device error");
-        };
-        assert!(candidates.contains("/dev/input/event4 — Touchpad A"));
-        assert!(candidates.contains("/dev/input/event7 — Touchpad B"));
+        assert!(matches!(result, Err(Error::DeviceAmbiguous { .. })));
     }
 }

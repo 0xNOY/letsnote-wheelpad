@@ -1,7 +1,7 @@
 use evdev::{AbsoluteAxisType, EventType, InputEvent};
 
+use crate::evdev::ContactSnapshot;
 use crate::fsm::ContactId;
-use crate::MAX_MT_SLOTS;
 
 const INACTIVE_TRACKING_ID: i32 = -1;
 
@@ -14,22 +14,29 @@ pub enum RoutingMode {
 
 #[derive(Debug)]
 pub struct Router {
-    current_slot: usize,
-    tracking_ids: [i32; MAX_MT_SLOTS],
-}
-
-impl Default for Router {
-    fn default() -> Self {
-        Self {
-            current_slot: 0,
-            tracking_ids: [INACTIVE_TRACKING_ID; MAX_MT_SLOTS],
-        }
-    }
+    current_slot: Option<usize>,
+    tracking_ids: Vec<i32>,
 }
 
 impl Router {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(slot_count: usize) -> Self {
+        Self {
+            current_slot: (slot_count > 0).then_some(0),
+            tracking_ids: vec![INACTIVE_TRACKING_ID; slot_count],
+        }
+    }
+
+    pub fn from_snapshot(snapshot: &ContactSnapshot) -> Self {
+        Self {
+            current_slot: snapshot.current_slot(),
+            tracking_ids: snapshot.tracking_ids().collect(),
+        }
+    }
+
+    pub fn reconcile(&mut self, snapshot: &ContactSnapshot) {
+        self.current_slot = snapshot.current_slot();
+        self.tracking_ids.clear();
+        self.tracking_ids.extend(snapshot.tracking_ids());
     }
 
     /// Route one SYN_REPORT-bounded physical frame.
@@ -42,20 +49,37 @@ impl Router {
         events: &[InputEvent],
         mode: RoutingMode,
         output: &mut Vec<InputEvent>,
-    ) {
+    ) -> std::io::Result<()> {
         output.clear();
         output.reserve(events.len());
 
         for event in events {
             if event.event_type() == EventType::ABSOLUTE {
                 let axis = AbsoluteAxisType(event.code());
-                if axis == AbsoluteAxisType::ABS_MT_SLOT && event.value() >= 0 {
-                    self.current_slot = event.value() as usize;
+                if axis == AbsoluteAxisType::ABS_MT_SLOT {
+                    self.current_slot = None;
+                    self.current_slot = usize::try_from(event.value())
+                        .ok()
+                        .filter(|slot| *slot < self.tracking_ids.len());
+                    if self.current_slot.is_none() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "ABS_MT_SLOT value {} outside 0..{}",
+                                event.value(),
+                                self.tracking_ids.len()
+                            ),
+                        ));
+                    }
                 }
                 if axis == AbsoluteAxisType::ABS_MT_TRACKING_ID {
-                    if let Some(tracking_id) = self.tracking_ids.get_mut(self.current_slot) {
-                        *tracking_id = event.value();
-                    }
+                    let slot = self.current_slot.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "ABS_MT_TRACKING_ID without a valid selected slot",
+                        )
+                    })?;
+                    self.tracking_ids[slot] = event.value();
                 }
                 if self.suppress_position(axis, mode) {
                     continue;
@@ -67,6 +91,7 @@ impl Router {
             }
             output.push(*event);
         }
+        Ok(())
     }
 
     fn suppress_position(&self, axis: AbsoluteAxisType, mode: RoutingMode) -> bool {
@@ -77,9 +102,8 @@ impl Router {
         match axis {
             AbsoluteAxisType::ABS_X | AbsoluteAxisType::ABS_Y => true,
             AbsoluteAxisType::ABS_MT_POSITION_X | AbsoluteAxisType::ABS_MT_POSITION_Y => {
-                self.current_slot == contact.slot
-                    && self.tracking_ids.get(self.current_slot).copied()
-                        == Some(contact.tracking_id)
+                self.current_slot == Some(contact.slot)
+                    && self.tracking_ids.get(contact.slot).copied() == Some(contact.tracking_id)
             }
             _ => false,
         }
@@ -138,10 +162,12 @@ mod tests {
             key(Key::BTN_LEFT, 0),
             syn(),
         ];
-        let mut router = Router::new();
+        let mut router = Router::new(5);
         let mut output = Vec::new();
 
-        router.route_frame(&input, RoutingMode::Passthrough, &mut output);
+        router
+            .route_frame(&input, RoutingMode::Passthrough, &mut output)
+            .unwrap();
 
         assert_eq!(semantics(&restore_report(&output)), semantics(&input));
     }
@@ -173,35 +199,41 @@ mod tests {
             abs(AbsoluteAxisType::ABS_MT_POSITION_X, 300),
             abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 400),
         ];
-        let mut router = Router::new();
+        let mut router = Router::new(5);
         let mut output = Vec::new();
 
-        router.route_frame(&input, RoutingMode::Capture(CAPTURED), &mut output);
+        router
+            .route_frame(&input, RoutingMode::Capture(CAPTURED), &mut output)
+            .unwrap();
 
         assert_eq!(semantics(&output), semantics(&expected));
     }
 
     #[test]
     fn selected_slot_context_survives_report_boundaries() {
-        let mut router = Router::new();
+        let mut router = Router::new(5);
         let mut output = Vec::new();
-        router.route_frame(
-            &with_report(vec![
-                abs(AbsoluteAxisType::ABS_MT_SLOT, 2),
-                abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, 20),
-            ]),
-            RoutingMode::Passthrough,
-            &mut output,
-        );
+        router
+            .route_frame(
+                &with_report(vec![
+                    abs(AbsoluteAxisType::ABS_MT_SLOT, 2),
+                    abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, 20),
+                ]),
+                RoutingMode::Passthrough,
+                &mut output,
+            )
+            .unwrap();
 
-        router.route_frame(
-            &with_report(vec![
-                abs(AbsoluteAxisType::ABS_MT_POSITION_X, 701),
-                abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 501),
-            ]),
-            RoutingMode::Capture(CAPTURED),
-            &mut output,
-        );
+        router
+            .route_frame(
+                &with_report(vec![
+                    abs(AbsoluteAxisType::ABS_MT_POSITION_X, 701),
+                    abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 501),
+                ]),
+                RoutingMode::Capture(CAPTURED),
+                &mut output,
+            )
+            .unwrap();
 
         assert!(output.is_empty());
     }
@@ -219,10 +251,12 @@ mod tests {
             key(Key::BTN_RIGHT, 0),
         ]);
         let expected = input[..input.len() - 1].to_vec();
-        let mut router = Router::new();
+        let mut router = Router::new(5);
         let mut output = Vec::new();
 
-        router.route_frame(&input, RoutingMode::Capture(CAPTURED), &mut output);
+        router
+            .route_frame(&input, RoutingMode::Capture(CAPTURED), &mut output)
+            .unwrap();
 
         assert_eq!(semantics(&output), semantics(&expected));
     }
@@ -237,35 +271,43 @@ mod tests {
             abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 480),
         ]);
         let expected = input[..input.len() - 1].to_vec();
-        let mut router = Router::new();
+        let mut router = Router::new(5);
         let mut output = Vec::new();
-        router.route_frame(
-            &with_report(vec![
-                abs(AbsoluteAxisType::ABS_MT_SLOT, CAPTURED.slot as i32),
-                abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, CAPTURED.tracking_id),
-            ]),
-            RoutingMode::Passthrough,
-            &mut output,
-        );
+        router
+            .route_frame(
+                &with_report(vec![
+                    abs(AbsoluteAxisType::ABS_MT_SLOT, CAPTURED.slot as i32),
+                    abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, CAPTURED.tracking_id),
+                ]),
+                RoutingMode::Passthrough,
+                &mut output,
+            )
+            .unwrap();
 
-        router.route_frame(&input, RoutingMode::Capture(CAPTURED), &mut output);
+        router
+            .route_frame(&input, RoutingMode::Capture(CAPTURED), &mut output)
+            .unwrap();
 
         assert_eq!(semantics(&output), semantics(&expected));
     }
 
     #[test]
     fn cursor_mirror_resumes_after_capture() {
-        let mut router = Router::new();
+        let mut router = Router::new(5);
         let mut output = Vec::new();
         let mirror = with_report(vec![
             abs(AbsoluteAxisType::ABS_X, 710),
             abs(AbsoluteAxisType::ABS_Y, 510),
         ]);
 
-        router.route_frame(&mirror, RoutingMode::Capture(CAPTURED), &mut output);
+        router
+            .route_frame(&mirror, RoutingMode::Capture(CAPTURED), &mut output)
+            .unwrap();
         assert!(output.is_empty());
 
-        router.route_frame(&mirror, RoutingMode::Passthrough, &mut output);
+        router
+            .route_frame(&mirror, RoutingMode::Passthrough, &mut output)
+            .unwrap();
         assert_eq!(semantics(&output), semantics(&mirror[..mirror.len() - 1]));
     }
 }

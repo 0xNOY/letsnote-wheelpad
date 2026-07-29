@@ -2,32 +2,66 @@ use std::f64::consts::PI;
 
 use evdev::{AbsoluteAxisType, EventType, InputEvent, Key};
 use letsnote_wheelpad::config::Scroll;
-use letsnote_wheelpad::detector::{CircularDetector, TouchSample};
-use letsnote_wheelpad::fsm::{Action, ContactId, Fsm, FsmState, TouchFrame};
-use letsnote_wheelpad::router::{Router, RoutingMode};
+use letsnote_wheelpad::detector::CoordinateTransform;
+use letsnote_wheelpad::evdev::{ContactSnapshot, PhysicalFrame};
+use letsnote_wheelpad::fsm::{Action, ContactId, FsmState};
+use letsnote_wheelpad::proxy::FrameProcessor;
 
 const CONTACT_A: ContactId = ContactId {
     slot: 2,
     tracking_id: 20,
 };
+const SLOT_COUNT: usize = 5;
 
-fn touch(id: ContactId, angle: f64) -> TouchFrame {
-    TouchFrame {
-        contact: true,
-        pos: Some(TouchSample {
-            x: 500 + (300.0 * angle.cos()).round() as i32,
-            y: 500 + (300.0 * angle.sin()).round() as i32,
-        }),
-        contact_id: Some(id),
+struct Harness {
+    processor: FrameProcessor,
+    routed: Vec<InputEvent>,
+    all_routed: Vec<InputEvent>,
+}
+
+impl Harness {
+    fn new(initial: ContactSnapshot) -> Self {
+        Self {
+            processor: FrameProcessor::new(
+                500,
+                500,
+                CoordinateTransform::default(),
+                Scroll::default().minimum_rotation_radius,
+                &initial,
+            ),
+            routed: Vec::new(),
+            all_routed: Vec::new(),
+        }
+    }
+
+    fn process(
+        &mut self,
+        contacts: ContactSnapshot,
+        events: Vec<InputEvent>,
+        reconciled: bool,
+    ) -> Action {
+        let frame = PhysicalFrame::from_parts(contacts, events, reconciled);
+        let action = self
+            .processor
+            .process_frame(&frame, &Scroll::default(), &mut self.routed)
+            .unwrap();
+        self.all_routed.extend(self.routed.iter().copied());
+        action
     }
 }
 
-fn lift(id: ContactId) -> TouchFrame {
-    TouchFrame {
-        contact: false,
-        pos: None,
-        contact_id: Some(id),
-    }
+fn empty_snapshot() -> ContactSnapshot {
+    ContactSnapshot::from_slot_values(&[(-1, 0, 0); SLOT_COUNT], Some(0), false).unwrap()
+}
+
+fn snapshot_a(angle: f64) -> ContactSnapshot {
+    let mut slots = [(-1, 0, 0); SLOT_COUNT];
+    slots[CONTACT_A.slot] = (
+        CONTACT_A.tracking_id,
+        500 + (300.0 * angle.cos()).round() as i32,
+        500 + (300.0 * angle.sin()).round() as i32,
+    );
+    ContactSnapshot::from_slot_values(&slots, Some(CONTACT_A.slot), true).unwrap()
 }
 
 fn abs(axis: AbsoluteAxisType, value: i32) -> InputEvent {
@@ -43,48 +77,49 @@ fn frame(mut events: Vec<InputEvent>) -> Vec<InputEvent> {
     events
 }
 
-fn process(
-    fsm: &mut Fsm,
-    detector: &mut CircularDetector,
-    router: &mut Router,
-    touch: TouchFrame,
-    events: &[InputEvent],
-    all_output: &mut Vec<InputEvent>,
-) -> Action {
-    let previous = fsm.state();
-    let tracked_before = fsm.contact_id();
-    let action = fsm.step(touch, detector, &Scroll::default());
-    let current = fsm.state();
-    let capture = if matches!(previous, FsmState::Scrolling { .. }) {
-        tracked_before
-    } else if matches!(current, FsmState::Scrolling { .. }) {
-        fsm.contact_id()
-    } else {
-        None
-    };
-    let mut output = Vec::new();
-    router.route_frame(
-        events,
-        capture.map_or(RoutingMode::Passthrough, RoutingMode::Capture),
-        &mut output,
+fn start_and_engage(harness: &mut Harness) {
+    harness.process(
+        snapshot_a(0.0),
+        frame(vec![
+            key(Key::BTN_TOUCH, 1),
+            abs(AbsoluteAxisType::ABS_MT_SLOT, CONTACT_A.slot as i32),
+            abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, CONTACT_A.tracking_id),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 800),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 500),
+        ]),
+        false,
     );
-    all_output.extend(output);
-    action
+    harness.process(
+        snapshot_a(PI / 8.0),
+        frame(vec![
+            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 777),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 615),
+        ]),
+        false,
+    );
+    assert!(harness.processor.is_scrolling());
 }
 
 #[test]
-fn button_held_engagement_release_and_tracked_lift_preserve_lifecycle() {
-    let mut fsm = Fsm::new(500, 500);
-    let mut detector = CircularDetector::new();
-    let mut router = Router::new();
-    let mut output = Vec::new();
+fn production_processor_suppresses_engagement_position() {
+    let mut harness = Harness::new(empty_snapshot());
+    start_and_engage(&mut harness);
 
-    process(
-        &mut fsm,
-        &mut detector,
-        &mut router,
-        touch(CONTACT_A, 0.0),
-        &frame(vec![
+    assert!(!harness.routed.iter().any(|event| {
+        event.event_type() == EventType::ABSOLUTE
+            && matches!(
+                AbsoluteAxisType(event.code()),
+                AbsoluteAxisType::ABS_MT_POSITION_X | AbsoluteAxisType::ABS_MT_POSITION_Y
+            )
+    }));
+}
+
+#[test]
+fn button_pair_and_captured_lift_lifecycle_are_forwarded() {
+    let mut harness = Harness::new(empty_snapshot());
+    harness.process(
+        snapshot_a(0.0),
+        frame(vec![
             key(Key::BTN_LEFT, 1),
             key(Key::BTN_TOUCH, 1),
             abs(AbsoluteAxisType::ABS_MT_SLOT, CONTACT_A.slot as i32),
@@ -92,172 +127,160 @@ fn button_held_engagement_release_and_tracked_lift_preserve_lifecycle() {
             abs(AbsoluteAxisType::ABS_MT_POSITION_X, 800),
             abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 500),
         ]),
-        &mut output,
+        false,
     );
-    process(
-        &mut fsm,
-        &mut detector,
-        &mut router,
-        touch(CONTACT_A, PI / 8.0),
-        &frame(vec![
+    harness.process(
+        snapshot_a(PI / 8.0),
+        frame(vec![
             abs(AbsoluteAxisType::ABS_MT_POSITION_X, 777),
             abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 615),
         ]),
-        &mut output,
+        false,
     );
-    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+    harness.process(
+        snapshot_a(PI / 8.0),
+        frame(vec![key(Key::BTN_LEFT, 0)]),
+        false,
+    );
+    assert!(harness.processor.is_scrolling());
 
-    process(
-        &mut fsm,
-        &mut detector,
-        &mut router,
-        touch(CONTACT_A, PI / 4.0),
-        &frame(vec![
-            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 712),
-            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 712),
-        ]),
-        &mut output,
-    );
-    process(
-        &mut fsm,
-        &mut detector,
-        &mut router,
-        touch(CONTACT_A, PI / 4.0),
-        &frame(vec![key(Key::BTN_LEFT, 0)]),
-        &mut output,
-    );
-    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
-
-    process(
-        &mut fsm,
-        &mut detector,
-        &mut router,
-        lift(CONTACT_A),
-        &frame(vec![
+    harness.process(
+        empty_snapshot(),
+        frame(vec![
             key(Key::BTN_TOUCH, 0),
             abs(AbsoluteAxisType::ABS_MT_SLOT, CONTACT_A.slot as i32),
             abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, -1),
         ]),
-        &mut output,
+        false,
     );
 
-    assert!(matches!(fsm.state(), FsmState::Debounce));
-    let left_values = output
+    assert!(matches!(harness.processor.state(), FsmState::Debounce));
+    let values = harness
+        .all_routed
         .iter()
         .filter(|event| event.event_type() == EventType::KEY && event.code() == Key::BTN_LEFT.0)
         .map(InputEvent::value)
         .collect::<Vec<_>>();
-    assert_eq!(left_values, vec![1, 0]);
-    assert!(output.iter().any(|event| {
-        event.event_type() == EventType::ABSOLUTE
-            && event.code() == AbsoluteAxisType::ABS_MT_TRACKING_ID.0
-            && event.value() == -1
+    assert_eq!(values, vec![1, 0]);
+    assert!(harness.all_routed.iter().any(|event| {
+        event.code() == AbsoluteAxisType::ABS_MT_TRACKING_ID.0 && event.value() == -1
     }));
 }
 
 #[test]
-fn second_contact_add_move_and_lift_do_not_end_or_steal_session() {
+fn second_contact_add_move_and_lift_remain_routed() {
     let contact_b = ContactId {
         slot: 0,
         tracking_id: 10,
     };
-    let mut fsm = Fsm::new(500, 500);
-    let mut detector = CircularDetector::new();
-    let mut router = Router::new();
-    let mut output = Vec::new();
-
-    process(
-        &mut fsm,
-        &mut detector,
-        &mut router,
-        touch(CONTACT_A, 0.0),
-        &frame(vec![
-            abs(AbsoluteAxisType::ABS_MT_SLOT, CONTACT_A.slot as i32),
-            abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, CONTACT_A.tracking_id),
-            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 800),
-            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 500),
-        ]),
-        &mut output,
-    );
-    process(
-        &mut fsm,
-        &mut detector,
-        &mut router,
-        touch(CONTACT_A, PI / 8.0),
-        &frame(vec![
-            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 777),
-            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 615),
-        ]),
-        &mut output,
-    );
-
-    process(
-        &mut fsm,
-        &mut detector,
-        &mut router,
-        touch(CONTACT_A, PI / 8.0),
-        &frame(vec![
+    let mut harness = Harness::new(empty_snapshot());
+    start_and_engage(&mut harness);
+    let mut slots = [(-1, 0, 0); SLOT_COUNT];
+    slots[CONTACT_A.slot] = (CONTACT_A.tracking_id, 777, 615);
+    slots[contact_b.slot] = (contact_b.tracking_id, 200, 300);
+    harness.process(
+        ContactSnapshot::from_slot_values(&slots, Some(contact_b.slot), true).unwrap(),
+        frame(vec![
             abs(AbsoluteAxisType::ABS_MT_SLOT, contact_b.slot as i32),
             abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, contact_b.tracking_id),
             abs(AbsoluteAxisType::ABS_MT_POSITION_X, 200),
             abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 300),
         ]),
-        &mut output,
+        false,
     );
-    process(
-        &mut fsm,
-        &mut detector,
-        &mut router,
-        touch(CONTACT_A, PI / 8.0),
-        &frame(vec![
+    slots[contact_b.slot] = (-1, 220, 320);
+    harness.process(
+        ContactSnapshot::from_slot_values(&slots, Some(contact_b.slot), true).unwrap(),
+        frame(vec![
             abs(AbsoluteAxisType::ABS_MT_POSITION_X, 220),
             abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 320),
             abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, -1),
         ]),
-        &mut output,
+        false,
     );
-    assert_eq!(fsm.contact_id(), Some(CONTACT_A));
-    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
 
-    process(
-        &mut fsm,
-        &mut detector,
-        &mut router,
-        touch(CONTACT_A, PI / 2.0),
-        &frame(vec![
-            abs(AbsoluteAxisType::ABS_MT_SLOT, CONTACT_A.slot as i32),
-            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 500),
-            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 800),
-        ]),
-        &mut output,
-    );
-    assert!(matches!(fsm.state(), FsmState::Scrolling { .. }));
+    assert_eq!(harness.processor.tracked_contact(), Some(CONTACT_A));
+    assert!(harness.processor.is_scrolling());
+    assert!(harness.all_routed.iter().any(|event| {
+        event.code() == AbsoluteAxisType::ABS_MT_POSITION_X.0 && event.value() == 220
+    }));
+}
 
-    process(
-        &mut fsm,
-        &mut detector,
-        &mut router,
-        lift(CONTACT_A),
-        &frame(vec![
+#[test]
+fn same_slot_reuse_is_not_captured() {
+    let mut harness = Harness::new(empty_snapshot());
+    start_and_engage(&mut harness);
+    let mut slots = [(-1, 0, 0); SLOT_COUNT];
+    slots[CONTACT_A.slot] = (31, 640, 480);
+    harness.process(
+        ContactSnapshot::from_slot_values(&slots, Some(CONTACT_A.slot), true).unwrap(),
+        frame(vec![
             abs(AbsoluteAxisType::ABS_MT_SLOT, CONTACT_A.slot as i32),
             abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, -1),
+            abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, 31),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 640),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 480),
         ]),
-        &mut output,
+        false,
     );
-    assert!(matches!(fsm.state(), FsmState::Debounce));
 
-    assert!(output.iter().any(|event| {
-        event.event_type() == EventType::ABSOLUTE
-            && event.code() == AbsoluteAxisType::ABS_MT_POSITION_X.0
-            && event.value() == 220
+    assert!(!harness.processor.is_scrolling());
+    assert!(harness.routed.iter().any(|event| {
+        event.code() == AbsoluteAxisType::ABS_MT_POSITION_X.0 && event.value() == 640
     }));
-    let ended_ids = output
-        .iter()
-        .filter(|event| {
-            event.event_type() == EventType::ABSOLUTE
-                && event.code() == AbsoluteAxisType::ABS_MT_TRACKING_ID.0
-                && event.value() == -1
-        })
-        .count();
-    assert_eq!(ended_ids, 2);
+}
+
+#[test]
+fn stationary_captured_contact_survives_liveness_reconciliation() {
+    let mut harness = Harness::new(empty_snapshot());
+    start_and_engage(&mut harness);
+    harness.process(snapshot_a(PI / 8.0), frame(Vec::new()), true);
+
+    assert!(harness.processor.is_scrolling());
+    assert_eq!(harness.processor.tracked_contact(), Some(CONTACT_A));
+}
+
+#[test]
+fn missing_captured_contact_ends_session_during_liveness_reconciliation() {
+    let mut harness = Harness::new(empty_snapshot());
+    start_and_engage(&mut harness);
+    harness.process(
+        empty_snapshot(),
+        frame(vec![
+            abs(AbsoluteAxisType::ABS_MT_SLOT, CONTACT_A.slot as i32),
+            abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, -1),
+            key(Key::BTN_TOUCH, 0),
+        ]),
+        true,
+    );
+
+    assert!(!harness.processor.is_scrolling());
+    assert!(harness.routed.iter().any(|event| {
+        event.code() == AbsoluteAxisType::ABS_MT_TRACKING_ID.0 && event.value() == -1
+    }));
+}
+
+#[test]
+fn startup_with_active_contact_uses_synchronized_identity() {
+    let initial = snapshot_a(0.0);
+    let mut harness = Harness::new(initial);
+    harness.process(
+        snapshot_a(0.0),
+        frame(vec![
+            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 800),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 500),
+        ]),
+        false,
+    );
+    harness.process(
+        snapshot_a(PI / 8.0),
+        frame(vec![
+            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 777),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 615),
+        ]),
+        false,
+    );
+
+    assert!(harness.processor.is_scrolling());
+    assert_eq!(harness.processor.tracked_contact(), Some(CONTACT_A));
 }

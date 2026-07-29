@@ -44,6 +44,19 @@ pub enum Error {
         capability: &'static str,
     },
 
+    #[error(
+        "evdev device {path:?} has unsupported ABS_MT_SLOT range [{minimum}, {maximum}]: {expected}"
+    )]
+    EvdevSlotRange {
+        path: PathBuf,
+        minimum: i32,
+        maximum: i32,
+        expected: &'static str,
+    },
+
+    #[error("evdev device {path:?} has invalid Type B state: {reason}")]
+    EvdevState { path: PathBuf, reason: String },
+
     #[error("evdev read error: {source}")]
     EvdevRead { source: io::Error },
 

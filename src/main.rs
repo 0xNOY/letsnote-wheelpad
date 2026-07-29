@@ -7,11 +7,11 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use letsnote_wheelpad::config::Config;
-use letsnote_wheelpad::detector::{CircularDetector, CoordinateTransform};
+use letsnote_wheelpad::detector::CoordinateTransform;
 use letsnote_wheelpad::error::{Error, Result};
-use letsnote_wheelpad::evdev::{GrabGuard, InputDevice};
-use letsnote_wheelpad::fsm::{Action, Fsm, FsmState};
-use letsnote_wheelpad::router::{Router, RoutingMode};
+use letsnote_wheelpad::evdev::{GrabGuard, InputDevice, PhysicalFrame};
+use letsnote_wheelpad::fsm::Action;
+use letsnote_wheelpad::proxy::FrameProcessor;
 use letsnote_wheelpad::runtime::{InstanceLock, LoopExit, ShutdownSignal};
 use letsnote_wheelpad::uinput::{UinputTouchpad, UinputWheel};
 
@@ -101,19 +101,20 @@ fn run(args: Args) -> Result<()> {
     // 6. Build the algorithm and FSM. History capacity is fixed at 20
     //    to match Windows WheelPad exactly (D-021-followup).
     let transform = CoordinateTransform::new(config.scroll.coordinate_y_scale);
-    let mut detector =
-        CircularDetector::with_geometry(transform, config.scroll.minimum_rotation_radius);
-    let mut fsm = Fsm::with_transform(input.center_x, input.center_y, transform);
-    let mut router = Router::new();
+    let mut processor = FrameProcessor::new(
+        input.center_x,
+        input.center_y,
+        transform,
+        config.scroll.minimum_rotation_radius,
+        &input.snapshot(),
+    );
 
     // 7. Main loop.
     let exit = run_event_loop(
         &mut input,
         &mut vtouchpad,
         &mut vwheel,
-        &mut fsm,
-        &mut detector,
-        &mut router,
+        &mut processor,
         &mut shutdown,
         &config,
     );
@@ -125,14 +126,11 @@ fn run(args: Args) -> Result<()> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_event_loop(
     input: &mut GrabGuard,
     vtouchpad: &mut UinputTouchpad,
     vwheel: &mut UinputWheel,
-    fsm: &mut Fsm,
-    detector: &mut CircularDetector,
-    router: &mut Router,
+    processor: &mut FrameProcessor,
     shutdown: &mut ShutdownSignal,
     config: &Config,
 ) -> LoopExit {
@@ -148,7 +146,25 @@ fn run_event_loop(
                 PollFd::new(&borrowed, PollFlags::POLLIN),
                 PollFd::new(&signal_fd, PollFlags::POLLIN),
             ];
-            match poll(&mut fds, -1) {
+            let timeout_ms = if processor.is_scrolling() { 1_000 } else { -1 };
+            match poll(&mut fds, timeout_ms) {
+                Ok(0) => {
+                    let frame = match input.reconcile_frame() {
+                        Ok(frame) => frame,
+                        Err(source) => return LoopExit::InputReadFailed { source },
+                    };
+                    if let Some(exit) = process_and_emit(
+                        &frame,
+                        processor,
+                        &config.scroll,
+                        vtouchpad,
+                        vwheel,
+                        &mut routed_events,
+                    ) {
+                        return exit;
+                    }
+                    continue;
+                }
                 Ok(_) => {}
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(source) => return LoopExit::PollFailed { source },
@@ -199,45 +215,51 @@ fn run_event_loop(
         }
 
         for pf in frames {
-            let prev_state = fsm.state();
-            let tracked_before = fsm.contact_id();
-            let frame = match tracked_before {
-                Some(contact) => pf.contacts.for_contact(contact),
-                None => pf.contacts.primary(),
-            };
-            let action = fsm.step(frame, detector, &config.scroll);
-            let now_state = fsm.state();
-
-            match action {
-                Action::None => {}
-                Action::EmitWheelV(t) => {
-                    if let Err(source) = vwheel.emit_v(t) {
-                        return LoopExit::VirtualWheelFailed { source };
-                    }
-                    debug!(ticks = t, "emit vertical");
-                }
-                Action::EmitWheelH(t) => {
-                    if let Err(source) = vwheel.emit_h(t) {
-                        return LoopExit::VirtualWheelFailed { source };
-                    }
-                    debug!(ticks = t, "emit horizontal");
-                }
-            }
-
-            let capture = if matches!(prev_state, FsmState::Scrolling { .. }) {
-                tracked_before
-            } else if matches!(now_state, FsmState::Scrolling { .. }) {
-                fsm.contact_id()
-            } else {
-                None
-            };
-            let mode = capture.map_or(RoutingMode::Passthrough, RoutingMode::Capture);
-            router.route_frame(&pf.events, mode, &mut routed_events);
-            if let Err(source) = vtouchpad.forward(&routed_events) {
-                return LoopExit::VirtualTouchpadFailed { source };
+            if let Some(exit) = process_and_emit(
+                &pf,
+                processor,
+                &config.scroll,
+                vtouchpad,
+                vwheel,
+                &mut routed_events,
+            ) {
+                return exit;
             }
         }
     }
+}
+
+fn process_and_emit(
+    frame: &PhysicalFrame,
+    processor: &mut FrameProcessor,
+    scroll: &letsnote_wheelpad::config::Scroll,
+    vtouchpad: &mut UinputTouchpad,
+    vwheel: &mut UinputWheel,
+    routed_events: &mut Vec<evdev::InputEvent>,
+) -> Option<LoopExit> {
+    let action = match processor.process_frame(frame, scroll, routed_events) {
+        Ok(action) => action,
+        Err(source) => return Some(LoopExit::InputReadFailed { source }),
+    };
+    match action {
+        Action::None => {}
+        Action::EmitWheelV(ticks) => {
+            if let Err(source) = vwheel.emit_v(ticks) {
+                return Some(LoopExit::VirtualWheelFailed { source });
+            }
+            debug!(ticks, "emit vertical");
+        }
+        Action::EmitWheelH(ticks) => {
+            if let Err(source) = vwheel.emit_h(ticks) {
+                return Some(LoopExit::VirtualWheelFailed { source });
+            }
+            debug!(ticks, "emit horizontal");
+        }
+    }
+    if let Err(source) = vtouchpad.forward(routed_events) {
+        return Some(LoopExit::VirtualTouchpadFailed { source });
+    }
+    None
 }
 
 fn init_tracing(config: &Config, debug_flag: bool) {
