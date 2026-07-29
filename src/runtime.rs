@@ -183,7 +183,38 @@ impl LoopExit {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new() -> Self {
+            loop {
+                let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "letsnote-wheelpad-test-{}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self { path },
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("failed to create test temp directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn only_requested_shutdown_is_successful() {
@@ -204,26 +235,18 @@ mod tests {
 
     #[test]
     fn advisory_lock_rejects_a_live_owner_but_allows_stale_files() {
-        let runtime_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("artifacts/refactor-input-proxy/lock-test");
-        fs::create_dir_all(&runtime_dir).unwrap();
+        let runtime_dir = TestTempDir::new();
         let device = Path::new("/dev/input/event-test");
 
-        let first = InstanceLock::acquire_at(&runtime_dir, device, "test").unwrap();
+        let first = InstanceLock::acquire_at(&runtime_dir.path, device, "test").unwrap();
         assert!(matches!(
-            InstanceLock::acquire_at(&runtime_dir, device, "test"),
+            InstanceLock::acquire_at(&runtime_dir.path, device, "test"),
             Err(Error::InstanceAlreadyRunning { .. })
         ));
         drop(first);
 
-        let second = InstanceLock::acquire_at(&runtime_dir, device, "test").unwrap();
+        let second = InstanceLock::acquire_at(&runtime_dir.path, device, "test").unwrap();
         drop(second);
-        fs::remove_file(runtime_dir.join("letsnote-wheelpad-test.lock")).unwrap();
-        fs::remove_dir(&runtime_dir).unwrap();
-        let parent = runtime_dir.parent().unwrap();
-        if parent.read_dir().unwrap().next().is_none() {
-            fs::remove_dir(parent).unwrap();
-        }
     }
 
     #[test]
