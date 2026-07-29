@@ -123,17 +123,13 @@ fn run(args: Args) -> Result<()> {
             }
             UngrabbedStartupAction::AttemptGrab => match ungrabbed.grab_if_quiescent()? {
                 GrabAttempt::Stable(guard) => {
-                    debug_assert_eq!(
-                        startup.inspect_grabbed(&guard.snapshot()),
-                        GrabbedStartupAction::AcceptStableGrab
-                    );
+                    let action = startup.inspect_grabbed(&guard.snapshot());
+                    debug_assert_eq!(action, GrabbedStartupAction::AcceptStableGrab);
                     break guard;
                 }
                 GrabAttempt::Retry(next) => {
-                    debug_assert_eq!(
-                        startup.inspect_grabbed(&next.snapshot()),
-                        GrabbedStartupAction::ReleaseAndRetry
-                    );
+                    let action = startup.inspect_grabbed(&next.snapshot());
+                    debug_assert_eq!(action, GrabbedStartupAction::ReleaseAndRetry);
                     ungrabbed = next;
                 }
             },
