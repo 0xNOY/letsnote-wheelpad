@@ -67,7 +67,7 @@ sensitivity          = 0      # -2..+2 ; lower = less sensitive
 detect_area_width    = 0      # 0..10 ; 0 = outer ring only, 10 = whole pad
 detect_area_radius   = 200.0  # inner radius at width 0, in X-axis units
 coordinate_y_scale   = 1.0    # multiplier for Y; use X range / Y range
-minimum_rotation_radius = 0.0 # reject tighter circles; 0 disables the limit
+minimum_rotation_radius = 100.0 # reject tighter circles; 0 disables the limit
 horizontal_start     = 2      # arc start in π/8 units (2 → 45°)
 horizontal_end       = 6      # arc end in π/8 units (6 → 135°)
 
@@ -85,7 +85,7 @@ level = "info"  # trace | debug | info | warn | error
 | `scroll.detect_area_width` | `0` | 0..10 | `0` = require finger near the edge; `10` = whole pad. |
 | `scroll.detect_area_radius` | `200.0` | > 0 | Inner dead-zone radius at width `0`, in raw X-axis units. Increase it if the active ring is too wide. |
 | `scroll.coordinate_y_scale` | `1.0` | > 0 | Multiplier applied to every Y distance. Set it to `X range / Y range` when a circular pad reports anisotropic coordinates. |
-| `scroll.minimum_rotation_radius` | `0.0` | ≥ 0 | Minimum local circle radius in corrected X-axis units. Smaller circular motions are ignored; `0` disables the limit. |
+| `scroll.minimum_rotation_radius` | `100.0` | ≥ 0 | Minimum local circle radius in corrected X-axis units. Smaller circular motions are ignored; `0` disables the limit. |
 | `scroll.horizontal_start` | `2` | 0..15 | π/8 units. Default 45° → 135° = the bottom edge of the pad. |
 | `scroll.horizontal_end` | `6` | 0..15 | |
 
