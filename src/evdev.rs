@@ -13,12 +13,7 @@ use crate::detector::TouchSample;
 use crate::error::{Error, Result};
 use crate::fsm::{ContactId, TouchFrame};
 use crate::uinput::{TOUCHPAD_PRODUCT_ID, VENDOR_ID, WHEEL_PRODUCT_ID};
-
-/// Maximum number of MT slots we track. The kernel exposes up to 10 in
-/// practice; touchpads typically advertise 5. We sweep all slots when
-/// rescanning for "lowest active" semantics (D-012), so the constant
-/// only bounds the per-frame map size, not gesture logic.
-const MAX_MT_SLOTS: usize = 16;
+use crate::MAX_MT_SLOTS;
 
 pub struct InputDevice {
     pub device: Device,

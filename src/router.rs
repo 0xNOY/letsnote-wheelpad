@@ -1,6 +1,9 @@
 use evdev::{AbsoluteAxisType, EventType, InputEvent};
 
 use crate::fsm::ContactId;
+use crate::MAX_MT_SLOTS;
+
+const INACTIVE_TRACKING_ID: i32 = -1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RoutingMode {
@@ -9,9 +12,19 @@ pub enum RoutingMode {
     Capture(ContactId),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Router {
     current_slot: usize,
+    tracking_ids: [i32; MAX_MT_SLOTS],
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self {
+            current_slot: 0,
+            tracking_ids: [INACTIVE_TRACKING_ID; MAX_MT_SLOTS],
+        }
+    }
 }
 
 impl Router {
@@ -39,6 +52,11 @@ impl Router {
                 if axis == AbsoluteAxisType::ABS_MT_SLOT && event.value() >= 0 {
                     self.current_slot = event.value() as usize;
                 }
+                if axis == AbsoluteAxisType::ABS_MT_TRACKING_ID {
+                    if let Some(tracking_id) = self.tracking_ids.get_mut(self.current_slot) {
+                        *tracking_id = event.value();
+                    }
+                }
                 if self.suppress_position(axis, mode) {
                     continue;
                 }
@@ -60,6 +78,8 @@ impl Router {
             AbsoluteAxisType::ABS_X | AbsoluteAxisType::ABS_Y => true,
             AbsoluteAxisType::ABS_MT_POSITION_X | AbsoluteAxisType::ABS_MT_POSITION_Y => {
                 self.current_slot == contact.slot
+                    && self.tracking_ids.get(self.current_slot).copied()
+                        == Some(contact.tracking_id)
             }
             _ => false,
         }
@@ -132,6 +152,7 @@ mod tests {
             abs(AbsoluteAxisType::ABS_X, 777),
             abs(AbsoluteAxisType::ABS_Y, 555),
             abs(AbsoluteAxisType::ABS_MT_SLOT, 2),
+            abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, 20),
             abs(AbsoluteAxisType::ABS_MT_POSITION_X, 700),
             abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 500),
             abs(AbsoluteAxisType::ABS_MT_PRESSURE, 60),
@@ -144,6 +165,7 @@ mod tests {
         ];
         let expected = vec![
             abs(AbsoluteAxisType::ABS_MT_SLOT, 2),
+            abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, 20),
             abs(AbsoluteAxisType::ABS_MT_PRESSURE, 60),
             abs(AbsoluteAxisType::ABS_MT_TOUCH_MAJOR, 30),
             abs(AbsoluteAxisType::ABS_MT_ORIENTATION, 1),
@@ -164,7 +186,10 @@ mod tests {
         let mut router = Router::new();
         let mut output = Vec::new();
         router.route_frame(
-            &with_report(vec![abs(AbsoluteAxisType::ABS_MT_SLOT, 2)]),
+            &with_report(vec![
+                abs(AbsoluteAxisType::ABS_MT_SLOT, 2),
+                abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, 20),
+            ]),
             RoutingMode::Passthrough,
             &mut output,
         );
@@ -196,6 +221,32 @@ mod tests {
         let expected = input[..input.len() - 1].to_vec();
         let mut router = Router::new();
         let mut output = Vec::new();
+
+        router.route_frame(&input, RoutingMode::Capture(CAPTURED), &mut output);
+
+        assert_eq!(semantics(&output), semantics(&expected));
+    }
+
+    #[test]
+    fn reused_captured_slot_forwards_the_new_contacts_initial_position() {
+        let input = with_report(vec![
+            abs(AbsoluteAxisType::ABS_MT_SLOT, CAPTURED.slot as i32),
+            abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, -1),
+            abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, 31),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 640),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 480),
+        ]);
+        let expected = input[..input.len() - 1].to_vec();
+        let mut router = Router::new();
+        let mut output = Vec::new();
+        router.route_frame(
+            &with_report(vec![
+                abs(AbsoluteAxisType::ABS_MT_SLOT, CAPTURED.slot as i32),
+                abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, CAPTURED.tracking_id),
+            ]),
+            RoutingMode::Passthrough,
+            &mut output,
+        );
 
         router.route_frame(&input, RoutingMode::Capture(CAPTURED), &mut output);
 

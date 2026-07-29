@@ -6,6 +6,9 @@
 //! cross-module access; the OSS surface kept truly public is just
 //! enough for synthetic tests to drive the algorithm and FSM directly.
 
+/// Fixed-size Type B MT slot shadow shared by input assembly and routing.
+pub(crate) const MAX_MT_SLOTS: usize = 16;
+
 pub mod config;
 pub mod detector;
 pub mod error;
