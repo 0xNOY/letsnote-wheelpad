@@ -1,6 +1,5 @@
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
 use nix::poll::{poll, PollFd, PollFlags};
@@ -13,10 +12,8 @@ use letsnote_wheelpad::error::{Error, Result};
 use letsnote_wheelpad::evdev::{GrabGuard, InputDevice};
 use letsnote_wheelpad::fsm::{Action, Fsm, FsmState};
 use letsnote_wheelpad::router::{Router, RoutingMode};
-use letsnote_wheelpad::runtime::{InstanceLock, LoopExit};
+use letsnote_wheelpad::runtime::{InstanceLock, LoopExit, ShutdownSignal};
 use letsnote_wheelpad::uinput::{UinputTouchpad, UinputWheel};
-
-static STOP: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -55,6 +52,11 @@ fn run(args: Args) -> Result<()> {
 
     info!(?config_path, "config loaded");
     debug!(?config, "effective config");
+
+    // Block shutdown signals before any resource is grabbed. signalfd
+    // makes signal delivery part of the same poll set as evdev, closing
+    // the check-then-sleep lost-wakeup race.
+    let mut shutdown = ShutdownSignal::new()?;
 
     // 1. Open the physical touchpad.
     let device_path = match args.device.or_else(|| config.device.clone()) {
@@ -104,10 +106,7 @@ fn run(args: Args) -> Result<()> {
     let mut fsm = Fsm::with_transform(input.center_x, input.center_y, transform);
     let mut router = Router::new();
 
-    // 7. Signal handling.
-    install_signal_handlers()?;
-
-    // 8. Main loop.
+    // 7. Main loop.
     let exit = run_event_loop(
         &mut input,
         &mut vtouchpad,
@@ -115,6 +114,7 @@ fn run(args: Args) -> Result<()> {
         &mut fsm,
         &mut detector,
         &mut router,
+        &mut shutdown,
         &config,
     );
     info!(reason = %exit, "input loop stopped");
@@ -125,6 +125,7 @@ fn run(args: Args) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_event_loop(
     input: &mut GrabGuard,
     vtouchpad: &mut UinputTouchpad,
@@ -132,38 +133,56 @@ fn run_event_loop(
     fsm: &mut Fsm,
     detector: &mut CircularDetector,
     router: &mut Router,
+    shutdown: &mut ShutdownSignal,
     config: &Config,
 ) -> LoopExit {
     let raw_fd = input.device.as_raw_fd();
     let mut routed_events = Vec::new();
     loop {
-        if STOP.load(Ordering::Relaxed) {
-            return LoopExit::RequestedShutdown;
-        }
-        // SAFETY: raw_fd is owned by `input.device` which outlives the
-        // borrow for the iteration; we never read/write through the
-        // BorrowedFd ourselves.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
-        let mut fds = [PollFd::new(&borrowed, PollFlags::POLLIN)];
-        let _ready = match poll(&mut fds, -1) {
-            Ok(n) => n,
-            Err(nix::errno::Errno::EINTR) => {
-                if STOP.load(Ordering::Relaxed) {
-                    return LoopExit::RequestedShutdown;
-                }
-                continue;
+        let (input_revents, signal_revents) = {
+            // SAFETY: raw_fd is owned by `input.device` which outlives
+            // this poll call; no access occurs through the borrowed FD.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+            let signal_fd = shutdown.fd().as_fd();
+            let mut fds = [
+                PollFd::new(&borrowed, PollFlags::POLLIN),
+                PollFd::new(&signal_fd, PollFlags::POLLIN),
+            ];
+            match poll(&mut fds, -1) {
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(source) => return LoopExit::PollFailed { source },
             }
-            Err(source) => return LoopExit::PollFailed { source },
+            (
+                fds[0].revents().unwrap_or_else(PollFlags::empty),
+                fds[1].revents().unwrap_or_else(PollFlags::empty),
+            )
         };
 
-        let revents = fds[0].revents().unwrap_or_else(PollFlags::empty);
-        if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+        if signal_revents.contains(PollFlags::POLLIN) {
+            match shutdown.read_requested() {
+                Ok(true) => return LoopExit::RequestedShutdown,
+                Ok(false) => {}
+                Err(source) => return LoopExit::SignalReadFailed { source },
+            }
+        }
+        if signal_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+        {
+            return LoopExit::SignalReadFailed {
+                source: nix::errno::Errno::EIO,
+            };
+        }
+
+        if input_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
             return LoopExit::InputDisconnected {
                 source: std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
-                    format!("poll reported {revents:?}"),
+                    format!("poll reported {input_revents:?}"),
                 ),
             };
+        }
+        if !input_revents.contains(PollFlags::POLLIN) {
+            continue;
         }
 
         let frames = match input.poll_frames() {
@@ -241,23 +260,4 @@ fn sd_notify_ready() -> std::io::Result<()> {
     notify(false, &[NotifyState::Ready])
         .map(|_| ())
         .map_err(|e| std::io::Error::other(e.to_string()))
-}
-
-fn install_signal_handlers() -> Result<()> {
-    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-
-    extern "C" fn handler(_sig: libc::c_int) {
-        STOP.store(true, Ordering::Relaxed);
-    }
-
-    let action = SigAction::new(
-        SigHandler::Handler(handler),
-        SaFlags::empty(),
-        SigSet::empty(),
-    );
-    unsafe {
-        sigaction(Signal::SIGTERM, &action).map_err(|source| Error::Signal { source })?;
-        sigaction(Signal::SIGINT, &action).map_err(|source| Error::Signal { source })?;
-    }
-    Ok(())
 }

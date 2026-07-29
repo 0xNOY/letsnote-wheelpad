@@ -5,8 +5,50 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use nix::fcntl::{flock, FlockArg};
+use nix::sys::signal::{SigSet, Signal};
+use nix::sys::signalfd::{SfdFlags, SignalFd};
 
 use crate::error::{Error, Result};
+
+#[derive(Debug)]
+pub struct ShutdownSignal {
+    fd: SignalFd,
+    previous_mask: SigSet,
+}
+
+impl ShutdownSignal {
+    pub fn new() -> Result<Self> {
+        let previous_mask = SigSet::thread_get_mask().map_err(|source| Error::Signal { source })?;
+        let mut mask = SigSet::empty();
+        mask.add(Signal::SIGTERM);
+        mask.add(Signal::SIGINT);
+        mask.thread_block()
+            .map_err(|source| Error::Signal { source })?;
+        match SignalFd::with_flags(&mask, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC) {
+            Ok(fd) => Ok(Self { fd, previous_mask }),
+            Err(source) => {
+                let _ = previous_mask.thread_set_mask();
+                Err(Error::Signal { source })
+            }
+        }
+    }
+
+    pub fn fd(&self) -> &SignalFd {
+        &self.fd
+    }
+
+    pub fn read_requested(&mut self) -> std::result::Result<bool, nix::errno::Errno> {
+        Ok(self.fd.read_signal()?.is_some_and(|signal| {
+            signal.ssi_signo == Signal::SIGTERM as u32 || signal.ssi_signo == Signal::SIGINT as u32
+        }))
+    }
+}
+
+impl Drop for ShutdownSignal {
+    fn drop(&mut self) {
+        let _ = self.previous_mask.thread_set_mask();
+    }
+}
 
 pub struct InstanceLock {
     _file: File,
@@ -125,6 +167,12 @@ pub enum LoopExit {
         #[source]
         source: io::Error,
     },
+
+    #[error("shutdown signal read failed: {source}")]
+    SignalReadFailed {
+        #[source]
+        source: nix::errno::Errno,
+    },
 }
 
 impl LoopExit {
@@ -176,5 +224,26 @@ mod tests {
         if parent.read_dir().unwrap().next().is_none() {
             fs::remove_dir(parent).unwrap();
         }
+    }
+
+    #[test]
+    fn shutdown_signal_restores_the_calling_threads_mask() {
+        let before = SigSet::thread_get_mask().unwrap();
+        {
+            let signal = ShutdownSignal::new().unwrap();
+            let blocked = SigSet::thread_get_mask().unwrap();
+            assert!(blocked.contains(Signal::SIGTERM));
+            assert!(blocked.contains(Signal::SIGINT));
+            assert!(signal.fd().as_raw_fd() >= 0);
+        }
+        let after = SigSet::thread_get_mask().unwrap();
+        assert_eq!(
+            before.contains(Signal::SIGTERM),
+            after.contains(Signal::SIGTERM)
+        );
+        assert_eq!(
+            before.contains(Signal::SIGINT),
+            after.contains(Signal::SIGINT)
+        );
     }
 }
