@@ -6,18 +6,20 @@
 //    and REL_HWHEEL{,_HI_RES}. This is where the scroll ticks come out.
 //
 // 2. UinputTouchpad — virtual touchpad that mirrors the physical pad's
-//    capabilities. We grab the physical pad permanently at startup and
-//    forward its events through this device, suppressing position
-//    updates while the FSM is in Scrolling state. Libinput attaches to
-//    the virtual pad only, so it can never have stale state from a
-//    transient grab/ungrab cycle.
+//    capabilities. After the physical pad is confirmed quiescent, we
+//    hold its grab and forward events through this device, suppressing
+//    captured-contact position updates while the FSM is Scrolling.
+//    Startup never transfers an already-active physical lifecycle
+//    halfway into this virtual device.
 
+use std::io;
 use std::path::Path;
 
 use evdev::{
+    raw_stream::RawDevice,
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AbsInfo, AbsoluteAxisType, AttributeSet, BusType, Device, EventType, InputEvent, InputId,
-    PropType, RelativeAxisType, UinputAbsSetup,
+    AbsInfo, AbsoluteAxisType, AttributeSet, BusType, EventType, InputEvent, InputId, PropType,
+    RelativeAxisType, UinputAbsSetup,
 };
 use tracing::warn;
 
@@ -26,8 +28,8 @@ use crate::error::{Error, Result};
 // --- Wheel device --------------------------------------------------------
 
 const WHEEL_NAME: &str = "Let's Note WheelPad (virtual wheel)";
-const VENDOR_ID: u16 = 0x6c6e; // ASCII "ln"
-const WHEEL_PRODUCT_ID: u16 = 0x7770; // ASCII "wp"
+pub(crate) const VENDOR_ID: u16 = 0x6c6e; // ASCII "ln"
+pub(crate) const WHEEL_PRODUCT_ID: u16 = 0x7770; // ASCII "wp"
 const VERSION: u16 = 1;
 
 /// One wheel "tick" = 120 hi-res units; same value real mice emit. Keeps
@@ -71,7 +73,7 @@ impl UinputWheel {
     /// (libinput convention). The caller already applied
     /// `reverse_vertical` flipping; this function does not interpret
     /// signs further.
-    pub fn emit_v(&mut self, ticks: i32) -> Result<()> {
+    pub fn emit_v(&mut self, ticks: i32) -> io::Result<()> {
         self.emit_axis(
             ticks,
             RelativeAxisType::REL_WHEEL,
@@ -80,7 +82,7 @@ impl UinputWheel {
     }
 
     /// Emit `ticks` horizontal wheel notches. Positive = scroll right.
-    pub fn emit_h(&mut self, ticks: i32) -> Result<()> {
+    pub fn emit_h(&mut self, ticks: i32) -> io::Result<()> {
         self.emit_axis(
             ticks,
             RelativeAxisType::REL_HWHEEL,
@@ -93,7 +95,7 @@ impl UinputWheel {
         ticks: i32,
         axis: RelativeAxisType,
         axis_hi_res: RelativeAxisType,
-    ) -> Result<()> {
+    ) -> io::Result<()> {
         if ticks == 0 {
             return Ok(());
         }
@@ -101,15 +103,13 @@ impl UinputWheel {
             InputEvent::new(EventType::RELATIVE, axis_hi_res.0, ticks * HI_RES_STEP),
             InputEvent::new(EventType::RELATIVE, axis.0, ticks),
         ];
-        self.dev
-            .emit(&events)
-            .map_err(|source| Error::UinputWrite { source })
+        self.dev.emit(&events)
     }
 }
 
 // --- Touchpad passthrough device -----------------------------------------
 
-const TOUCHPAD_PRODUCT_ID: u16 = 0x7470; // ASCII "tp"
+pub(crate) const TOUCHPAD_PRODUCT_ID: u16 = 0x7470; // ASCII "tp"
 
 pub struct UinputTouchpad {
     dev: VirtualDevice,
@@ -121,7 +121,7 @@ impl UinputTouchpad {
     /// name (with a suffix) so libinput's name-regex quirks keep
     /// matching, but uses a distinct vendor/product so libinput
     /// classifies it as a separate device.
-    pub fn create_from_physical(physical: &Device) -> Result<Self> {
+    pub fn create_from_physical(physical: &RawDevice) -> Result<Self> {
         if !Path::new("/dev/uinput").exists() {
             return Err(Error::UinputMissing);
         }
@@ -219,45 +219,28 @@ impl UinputTouchpad {
         Ok(Self { dev })
     }
 
-    /// Forward a batch of physical events to the virtual touchpad.
-    /// The caller is responsible for deciding whether to forward at
-    /// all (e.g., suppress while the FSM is in Scrolling).
-    ///
-    /// SYN_REPORTs in the input are stripped because `emit()` inserts
-    /// its own. When `strip_positions` is true, ABS_X / ABS_Y /
-    /// ABS_MT_POSITION_X / ABS_MT_POSITION_Y events are also dropped
-    /// — used for the lift batch that transitions out of Scrolling,
-    /// so libinput sees the BTN_TOUCH=0 / ABS_MT_TRACKING_ID=-1
-    /// transition without a synthetic position jump from the prior
-    /// pre-engagement position.
-    pub fn forward(&mut self, events: &[InputEvent], strip_positions: bool) -> Result<()> {
-        let filtered: Vec<InputEvent> = events
-            .iter()
-            .copied()
-            .filter(|ev| {
-                if ev.event_type() == EventType::SYNCHRONIZATION {
-                    return false;
-                }
-                if strip_positions && ev.event_type() == EventType::ABSOLUTE {
-                    let axis = AbsoluteAxisType(ev.code());
-                    if matches!(
-                        axis,
-                        AbsoluteAxisType::ABS_X
-                            | AbsoluteAxisType::ABS_Y
-                            | AbsoluteAxisType::ABS_MT_POSITION_X
-                            | AbsoluteAxisType::ABS_MT_POSITION_Y
-                    ) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
-        if filtered.is_empty() {
-            return Ok(());
-        }
-        self.dev
-            .emit(&filtered)
-            .map_err(|source| Error::UinputWrite { source })
+    pub fn select_mt_slot(&mut self, slot: usize) -> io::Result<()> {
+        self.dev.emit(&[mt_slot_event(slot)?])
     }
+
+    /// Emit one frame after event-level routing. `events` must not
+    /// contain SYN_REPORT because evdev's `VirtualDevice::emit()`
+    /// appends exactly one report terminator.
+    pub fn forward(&mut self, events: &[InputEvent]) -> io::Result<()> {
+        self.dev.emit(events)
+    }
+}
+
+pub(crate) fn mt_slot_event(slot: usize) -> io::Result<InputEvent> {
+    let value = i32::try_from(slot).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("MT slot {slot} cannot be represented as i32"),
+        )
+    })?;
+    Ok(InputEvent::new(
+        EventType::ABSOLUTE,
+        AbsoluteAxisType::ABS_MT_SLOT.0,
+        value,
+    ))
 }
