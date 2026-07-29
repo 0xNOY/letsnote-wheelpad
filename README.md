@@ -111,20 +111,31 @@ minimum_rotation_radius = 500.0
 journalctl --user -u letsnote-wheelpad -f
 ```
 
-If scrolling feels too fast or too slow, adjust `scroll.sensitivity` in the config (-2..+2). The daemon does not auto-calibrate — history capacity is fixed at 20 slots to match Windows exactly (see DECISIONS.md D-021-followup).
+If scrolling feels too fast or too slow, adjust `scroll.sensitivity` in the config (-2..+2). The daemon does not auto-calibrate — detector history is fixed at 20 samples to match Windows exactly.
 
 ## Known issues / non-goals
 
 - **`WheelUnderCursor` is not configurable.** On Wayland the compositor routes input to the focused surface; there's no userland override.
 - **Vertical circular scrolling is tested on Synaptics TM3562-3 and CF-SZ6 SYN0502.** Other touchpads may work with `device_name_regex` and coordinate calibration, but no compatibility promises.
+- **The input-proxy recovery changes are not yet hardware-validated.** Startup with contacts already active, signal shutdown, `SYN_DROPPED` recovery, and button-held scrolling still require an end-to-end test with a physical touchpad, uinput, and libinput.
 - **Excel arrow-key fallback is gone.** Modern Excel routes horizontal wheel events natively; we don't need the Windows hack.
 - **No coasting/kinetic scrolling.** Matches the Windows WheelPad behaviour; xf86 has it but we don't.
 
+## Input proxy safety and recovery
+
+Only physical Type B multitouch devices advertising `ABS_MT_SLOT`, `ABS_MT_TRACKING_ID`, `ABS_MT_POSITION_X/Y`, and `BTN_TOUCH` are accepted. Discovery filters unsupported candidates before deciding whether a device name is ambiguous. All `BUS_VIRTUAL` devices are rejected, as are devices carrying letsnote-wheelpad's own name or input IDs, to prevent the daemon from recursively selecting its uinput output.
+
+At startup, the daemon reads the advertised slot range and snapshots every slot's tracking ID and position with `EVIOCGMTSLOTS`. It initializes both gesture input state and routing state from that snapshot. The evdev stream is read in raw mode so `SYN_DROPPED` remains visible; after a drop, the daemon refreshes slot tracking IDs and positions and emits the basic lifecycle needed to reconcile changed contacts. Full reconstruction of every virtual auxiliary key/ABS property after `SYN_DROPPED` is not implemented.
+
+The previous unconditional five-second scrolling watchdog has been removed. While scrolling, the poll loop wakes once per second to query physical tracking IDs. A stationary session remains active while the captured `(slot, tracking_id)` still exists. If that identity has disappeared, reconciliation supplies its lift to the normal FSM and ends the session. A reconciliation I/O failure is fatal, causing the grab to be released and the daemon to exit non-zero.
+
+SIGTERM and SIGINT are blocked and received through `signalfd`, which is polled with the evdev FD and therefore cannot be lost between a stop-flag check and a blocking poll. Fatal poll, evdev, reconciliation, or uinput errors terminate the daemon; the `EVIOCGRAB` owner is released by an RAII guard on normal shutdown and error paths. Duplicate instances are prevented per device within the same UID and XDG runtime directory.
+
 ## How it works (one-paragraph version)
 
-The daemon takes exclusive ownership of the physical touchpad at startup (`EVIOCGRAB`, held forever) and creates two virtual `uinput` devices that libinput attaches to instead: a touchpad mirror (same capabilities as the physical pad) and a wheel. All physical touch events are forwarded verbatim to the virtual touchpad — so cursor, taps, clicks, and multi-finger gestures keep working exactly as before. When a 6-state FSM (`Idle → Contact → Moving → Scrolling → Debounce`) decides a finger is drawing a circle in the outer ring, we **suppress** the forwarding for that gesture's duration (cursor freezes, as desired) and integrate chord-direction angles into an accumulator. Each ±π crossing emits one wheel notch on the virtual wheel. When the finger lifts, we forward the lift event (with position stripped) so libinput sees a clean end-of-gesture without a synthetic cursor jump.
+The daemon takes exclusive ownership of the physical touchpad while it is running and creates a virtual touchpad mirror plus a virtual wheel. Outside a WheelPad session, events are forwarded in order. Once the existing FSM and circular detector engage, routing suppresses only the captured contact's `ABS_MT_POSITION_X/Y` events and the primary `ABS_X/Y` cursor mirror. Buttons, slot/tracking lifecycle, auxiliary touch data, MSC events, and non-captured contacts remain forwarded. The detector's mathematics, engagement threshold, constants, fixed 20-sample history, sensitivity table, and pause/resume interaction are unchanged. Each existing ±π accumulator crossing emits one wheel notch; lifting the captured tracking ID ends the session while preserving the contact lifecycle on the virtual touchpad.
 
-For the full algorithm details and the architectural pivot history — see `DECISIONS.md` (D-022 is the passthrough decision; D-008..D-021 are the algorithm choices) and the analysis docs alongside the source.
+For the full algorithm details and architectural history, see the source and its synthetic regression tests.
 
 ## License
 

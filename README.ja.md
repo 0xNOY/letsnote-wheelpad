@@ -111,20 +111,31 @@ minimum_rotation_radius = 500.0
 journalctl --user -u letsnote-wheelpad -f
 ```
 
-スクロール感度がおかしいときは、設定ファイルの `scroll.sensitivity`（-2..+2）で調整してください。本デーモンは自動キャリブレーションを行いません — 履歴容量は Windows 完全互換のため 20 スロット固定です（DECISIONS.md D-021-followup 参照）。
+スクロール感度がおかしいときは、設定ファイルの `scroll.sensitivity`（-2..+2）で調整してください。本デーモンは自動キャリブレーションを行いません — detector 履歴は Windows 完全互換のため 20 sample 固定です。
 
 ## 既知の制限・非対応事項
 
 - **`WheelUnderCursor` は設定不可。** Wayland ではコンポジタがフォーカス先サーフェスにイベントを配るため、ユーザランドからの上書きはできません。
 - **縦方向の円スクロールは Synaptics TM3562-3 と CF-SZ6 SYN0502 で実機検証済み。** 他のタッチパッドでも `device_name_regex` と座標補正を設定すれば動く可能性はありますが、動作保証はしません。
+- **入力プロキシの復旧処理はまだ実機検証していません。** 接触中の起動、signal shutdown、`SYN_DROPPED` 復旧、ボタンを押したままのスクロールは、物理タッチパッド・uinput・libinput を通した end-to-end 試験が必要です。
 - **Excel 用矢印キーフォールバックは削除。** 現代の Excel は横ホイールイベントをネイティブで処理するため、Windows 版のハックは不要です。
 - **コースティング/慣性スクロールなし。** Windows 版 WheelPad に合わせています。xf86 にはありますが、本プロジェクトでは実装しません。
 
+## 入力プロキシの安全性と復旧
+
+入力元として受け付けるのは、`ABS_MT_SLOT`、`ABS_MT_TRACKING_ID`、`ABS_MT_POSITION_X/Y`、`BTN_TOUCH` を公開する物理 Type B multitouch device だけです。自動探索では、未対応候補を除外してから同名候補の曖昧性を判定します。再帰的に自分の uinput 出力を選ばないよう、すべての `BUS_VIRTUAL` device に加え、letsnote-wheelpad 固有の名前または input ID を持つ device を拒否します。
+
+起動時には公開された slot 範囲を読み、`EVIOCGMTSLOTS` で全 slot の tracking ID と座標を snapshot し、gesture input state と routing state の両方を初期化します。evdev stream は raw mode で読み、`SYN_DROPPED` を検出したら slot の tracking ID と座標を再取得し、変化した contact の基本 lifecycle を同期します。ただし、`SYN_DROPPED` 後にすべての補助 key/ABS state を仮想 device 上へ完全再構築する処理は未実装です。
+
+以前の無条件な 5 秒 scrolling watchdog は削除しました。Scrolling 中だけ poll loop が 1 秒ごとに物理 tracking ID を確認します。捕捉中の `(slot, tracking_id)` が存在する限り、指が静止していても session を維持します。その identity が消えた場合は、同期した lift を通常の FSM へ渡して session を終了します。同期 I/O が失敗した場合は fatal error とし、grab を解放して非ゼロ終了します。
+
+SIGTERM と SIGINT は block したうえで `signalfd` から受信し、evdev FD と同時に poll するため、stop flag の確認と blocking poll の間で signal を取りこぼしません。fatal な poll、evdev、同期、uinput error では daemon を終了し、正常終了・異常終了のどちらでも RAII guard が `EVIOCGRAB` を解放します。多重起動防止の範囲は、同一 UID・同一 XDG runtime directory 内の同一 device です。
+
 ## 仕組み（一段落版）
 
-起動時に物理タッチパッドを `EVIOCGRAB` で恒久的に占有し、libinput がアタッチする 2 つの仮想 `uinput` デバイス（物理パッド能力をミラーリングしたタッチパッドと、ホイール）を生成します。物理タッチイベントはすべて仮想タッチパッドへそのまま転送するため、カーソル・タップ・クリック・マルチフィンガージェスチャは従来どおり動作します。6 状態の FSM（`Idle → Contact → Moving → Scrolling → Debounce`）が、指が外周で円を描いていると判定すると、そのジェスチャ期間中だけ転送を**抑止**します（カーソル凍結）。同時に、隣接サンプル間の方向ベクトル角を積分し、±π を超えるたびに仮想ホイールから 1 ノッチを発行します。指を離すと、位置情報を除去したリフトイベントを転送し、libinput が合成的なカーソルジャンプを起こさずジェスチャ終了を認識できるようにします。
+daemon は実行中だけ物理タッチパッドを排他的に占有し、仮想タッチパッド mirror と仮想 wheel を生成します。WheelPad session 外では event を順序どおり転送します。既存の FSM と円運動 detector が engagement した後は、捕捉 contact の `ABS_MT_POSITION_X/Y` と primary cursor mirror の `ABS_X/Y` だけを抑止します。button、slot/tracking lifecycle、補助 touch data、MSC event、非捕捉 contact は引き続き転送します。detector の数式、開始閾値、定数、20 sample 固定履歴、感度 table、停止・再開操作は変更していません。既存の accumulator が ±π を超えるたびに wheel 1 notch を発行し、捕捉した tracking ID の lift で session を終了しつつ、仮想タッチパッドへ contact lifecycle を維持します。
 
-アルゴリズムの詳細とアーキテクチャの変更経緯は `DECISIONS.md` を参照してください（パススルー化の決定は D-022、アルゴリズム選択は D-008〜D-021）。
+アルゴリズムとアーキテクチャの詳細は、source と synthetic regression test を参照してください。
 
 ## ライセンス
 
