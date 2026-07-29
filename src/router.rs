@@ -31,7 +31,7 @@ impl Router {
         output: &mut Vec<InputEvent>,
     ) {
         output.clear();
-        output.reserve(events.len().saturating_sub(output.capacity()));
+        output.reserve(events.len());
 
         for event in events {
             if event.event_type() == EventType::ABSOLUTE {

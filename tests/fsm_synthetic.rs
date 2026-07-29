@@ -319,8 +319,8 @@ fn scrolling_retains_the_engaging_contact_identity() {
 
 #[test]
 fn force_idle_resets_state() {
-    // Watchdog path: after force_idle the FSM is back at Idle even if
-    // it was mid-Scrolling.
+    // The explicit recovery hook remains deterministic and is not
+    // driven by inactivity, buttons, or additional contacts.
     let mut fsm = Fsm::new(500, 500);
     let mut det = CircularDetector::new();
     let scroll = default_scroll();
