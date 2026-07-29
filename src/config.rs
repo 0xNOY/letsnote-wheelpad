@@ -23,6 +23,8 @@ pub struct Scroll {
     pub reverse_horizontal: bool,
     pub sensitivity: i32,
     pub detect_area_width: i32,
+    pub detect_area_radius: f64,
+    pub coordinate_y_scale: f64,
     pub horizontal_start: i32,
     pub horizontal_end: i32,
 }
@@ -56,6 +58,8 @@ impl Default for Scroll {
             reverse_horizontal: false,
             sensitivity: 0,
             detect_area_width: 0,
+            detect_area_radius: 200.0,
+            coordinate_y_scale: 1.0,
             horizontal_start: 2,
             horizontal_end: 6,
         }
@@ -109,6 +113,20 @@ impl Config {
                 expected: "0..=10",
             });
         }
+        if !s.detect_area_radius.is_finite() || s.detect_area_radius <= 0.0 {
+            return Err(Error::ConfigFloatRange {
+                key: "scroll.detect_area_radius",
+                value: s.detect_area_radius,
+                expected: "a finite value greater than 0",
+            });
+        }
+        if !s.coordinate_y_scale.is_finite() || s.coordinate_y_scale <= 0.0 {
+            return Err(Error::ConfigFloatRange {
+                key: "scroll.coordinate_y_scale",
+                value: s.coordinate_y_scale,
+                expected: "a finite value greater than 0",
+            });
+        }
         if !(0..=15).contains(&s.horizontal_start) {
             return Err(Error::ConfigRange {
                 key: "scroll.horizontal_start",
@@ -156,6 +174,8 @@ mod tests {
         assert!(!c.scroll.horizontal_enable);
         assert_eq!(c.scroll.sensitivity, 0);
         assert_eq!(c.scroll.detect_area_width, 0);
+        assert_eq!(c.scroll.detect_area_radius, 200.0);
+        assert_eq!(c.scroll.coordinate_y_scale, 1.0);
         assert_eq!(c.scroll.horizontal_start, 2);
         assert_eq!(c.scroll.horizontal_end, 6);
     }
@@ -172,12 +192,25 @@ mod tests {
         assert!(c.scroll.horizontal_enable);
         // unspecified keys keep defaults
         assert_eq!(c.scroll.horizontal_start, 2);
+        assert_eq!(c.scroll.detect_area_radius, 200.0);
+        assert_eq!(c.scroll.coordinate_y_scale, 1.0);
     }
 
     #[test]
     fn validate_rejects_out_of_range_sensitivity() {
         let mut c = Config::default();
         c.scroll.sensitivity = 5;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_radial_gate_geometry() {
+        let mut c = Config::default();
+        c.scroll.detect_area_radius = 0.0;
+        assert!(c.validate().is_err());
+
+        c.scroll.detect_area_radius = 200.0;
+        c.scroll.coordinate_y_scale = f64::NAN;
         assert!(c.validate().is_err());
     }
 }

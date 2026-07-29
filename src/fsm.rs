@@ -3,8 +3,8 @@
 
 use crate::config::Scroll;
 use crate::detector::{
-    engagement_swept_angle, radial_gate_ok, within_horizontal_arc, CircularDetector, TouchSample,
-    TRIGGER_ANGLE,
+    engagement_swept_angle, radial_gate_ok, within_horizontal_arc, CircularDetector,
+    CoordinateTransform, TouchSample, TRIGGER_ANGLE,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -51,14 +51,20 @@ pub struct Fsm {
     state: FsmState,
     center_x: i32,
     center_y: i32,
+    transform: CoordinateTransform,
 }
 
 impl Fsm {
     pub fn new(center_x: i32, center_y: i32) -> Self {
+        Self::with_transform(center_x, center_y, CoordinateTransform::default())
+    }
+
+    pub fn with_transform(center_x: i32, center_y: i32, transform: CoordinateTransform) -> Self {
         Self {
             state: FsmState::Idle,
             center_x,
             center_y,
+            transform,
         }
     }
 
@@ -94,7 +100,14 @@ impl Fsm {
             (FsmState::Idle, false, _) | (FsmState::Idle, true, None) => Action::None,
             (FsmState::Idle, true, Some(s)) => {
                 // Fresh touch-down: radial-gate classifier (FUN_140005a00).
-                if radial_gate_ok(self.center_x, self.center_y, s, scroll.detect_area_width) {
+                if radial_gate_ok(
+                    self.center_x,
+                    self.center_y,
+                    s,
+                    scroll.detect_area_width,
+                    scroll.detect_area_radius,
+                    self.transform,
+                ) {
                     // Outside dead zone → MOVING. Capture engage_start
                     // here, matching DAT_14003cc18 being set at
                     // FUN_1400046a0 line 203 only on the state 1 → state 3
@@ -131,14 +144,26 @@ impl Fsm {
                 Action::None
             }
             (FsmState::Moving { engage_start }, true, Some(s)) => {
-                if !radial_gate_ok(self.center_x, self.center_y, s, scroll.detect_area_width) {
+                if !radial_gate_ok(
+                    self.center_x,
+                    self.center_y,
+                    s,
+                    scroll.detect_area_width,
+                    scroll.detect_area_radius,
+                    self.transform,
+                ) {
                     // Slipped back into the dead zone — fall back to
                     // Contact (FUN_1400046a0 case 3, lines 127-137).
                     self.state = FsmState::Contact { origin: s };
                     Action::None
                 } else {
-                    let swept =
-                        engagement_swept_angle(self.center_x, self.center_y, engage_start, s);
+                    let swept = engagement_swept_angle(
+                        self.center_x,
+                        self.center_y,
+                        engage_start,
+                        s,
+                        self.transform,
+                    );
                     if swept.abs() > TRIGGER_ANGLE {
                         // Engagement! Reset detector and enter Scrolling.
                         // The physical pad is already grabbed (forever);
@@ -151,7 +176,14 @@ impl Fsm {
                         detector.push_if_moved(s);
                         let ticks = detector.step(scroll.sensitivity);
                         if ticks != 0 {
-                            emit(ticks, scroll, self.center_x, self.center_y, s)
+                            emit(
+                                ticks,
+                                scroll,
+                                self.center_x,
+                                self.center_y,
+                                s,
+                                self.transform,
+                            )
                         } else {
                             Action::None
                         }
@@ -175,7 +207,14 @@ impl Fsm {
                 detector.push_if_moved(s);
                 let ticks = detector.step(scroll.sensitivity);
                 if ticks != 0 {
-                    emit(ticks, scroll, self.center_x, self.center_y, s)
+                    emit(
+                        ticks,
+                        scroll,
+                        self.center_x,
+                        self.center_y,
+                        s,
+                        self.transform,
+                    )
                 } else {
                     Action::None
                 }
@@ -209,7 +248,14 @@ impl Fsm {
 /// EmitWheelV / EmitWheelH action. The horizontal arc is only consulted
 /// when `horizontal_enable = true` — vertical scroll is never angle-gated
 /// (linux-design.md §5 "Vertical scroll is NOT angle-gated").
-fn emit(ticks: i32, scroll: &Scroll, center_x: i32, center_y: i32, current: TouchSample) -> Action {
+fn emit(
+    ticks: i32,
+    scroll: &Scroll,
+    center_x: i32,
+    center_y: i32,
+    current: TouchSample,
+    transform: CoordinateTransform,
+) -> Action {
     if scroll.horizontal_enable
         && within_horizontal_arc(
             center_x,
@@ -217,6 +263,7 @@ fn emit(ticks: i32, scroll: &Scroll, center_x: i32, center_y: i32, current: Touc
             current,
             scroll.horizontal_start,
             scroll.horizontal_end,
+            transform,
         )
     {
         let signed = if scroll.reverse_horizontal {

@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use letsnote_wheelpad::config::Config;
-use letsnote_wheelpad::detector::CircularDetector;
+use letsnote_wheelpad::detector::{CircularDetector, CoordinateTransform};
 use letsnote_wheelpad::error::{Error, Result};
 use letsnote_wheelpad::evdev::InputDevice;
 use letsnote_wheelpad::fsm::{Action, Fsm, FsmState};
@@ -104,8 +104,9 @@ fn run(args: Args) -> Result<()> {
 
     // 6. Build the algorithm and FSM. History capacity is fixed at 20
     //    to match Windows WheelPad exactly (D-021-followup).
-    let mut detector = CircularDetector::new();
-    let mut fsm = Fsm::new(input.center_x, input.center_y);
+    let transform = CoordinateTransform::new(config.scroll.coordinate_y_scale);
+    let mut detector = CircularDetector::with_transform(transform);
+    let mut fsm = Fsm::with_transform(input.center_x, input.center_y, transform);
 
     // 7. Signal handling.
     install_signal_handlers()?;

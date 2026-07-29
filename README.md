@@ -65,6 +65,8 @@ horizontal_enable    = false  # enable bottom-edge horizontal-scroll wedge
 reverse_horizontal   = false
 sensitivity          = 0      # -2..+2 ; lower = less sensitive
 detect_area_width    = 0      # 0..10 ; 0 = outer ring only, 10 = whole pad
+detect_area_radius   = 200.0  # inner radius at width 0, in X-axis units
+coordinate_y_scale   = 1.0    # multiplier for Y; use X range / Y range
 horizontal_start     = 2      # arc start in π/8 units (2 → 45°)
 horizontal_end       = 6      # arc end in π/8 units (6 → 135°)
 
@@ -80,8 +82,25 @@ level = "info"  # trace | debug | info | warn | error
 | `scroll.reverse_horizontal` | `false` | bool | |
 | `scroll.sensitivity` | `0` | -2..+2 | Indexes the multiplier table `[10, 14, 20, 28, 40]`. |
 | `scroll.detect_area_width` | `0` | 0..10 | `0` = require finger near the edge; `10` = whole pad. |
+| `scroll.detect_area_radius` | `200.0` | > 0 | Inner dead-zone radius at width `0`, in raw X-axis units. Increase it if the active ring is too wide. |
+| `scroll.coordinate_y_scale` | `1.0` | > 0 | Multiplier applied to every Y distance. Set it to `X range / Y range` when a circular pad reports anisotropic coordinates. |
 | `scroll.horizontal_start` | `2` | 0..15 | π/8 units. Default 45° → 135° = the bottom edge of the pad. |
 | `scroll.horizontal_end` | `6` | 0..15 | |
+
+### CF-SZ6 (SYN0502)
+
+On one CF-SZ6, the circular pad was observed as
+`SynPS/2 Synaptics TouchPad`, with X=1210..5780 and Y=1250..4680. Vertical
+circular scrolling was verified with:
+
+```toml
+device_name_regex = "SynPS/2 Synaptics TouchPad"
+
+[scroll]
+detect_area_width  = 0
+detect_area_radius = 1965.0
+coordinate_y_scale = 1.33236 # (5780 - 1210) / (4680 - 1250)
+```
 
 ### View logs
 
@@ -94,7 +113,7 @@ If scrolling feels too fast or too slow, adjust `scroll.sensitivity` in the conf
 ## Known issues / non-goals
 
 - **`WheelUnderCursor` is not configurable.** On Wayland the compositor routes input to the focused surface; there's no userland override.
-- **Only the Synaptics TM3562-3 family is tested.** Other touchpads may work with `device_name_regex` overrides, but no compatibility promises.
+- **Vertical circular scrolling is tested on Synaptics TM3562-3 and CF-SZ6 SYN0502.** Other touchpads may work with `device_name_regex` and coordinate calibration, but no compatibility promises.
 - **Excel arrow-key fallback is gone.** Modern Excel routes horizontal wheel events natively; we don't need the Windows hack.
 - **No coasting/kinetic scrolling.** Matches the Windows WheelPad behaviour; xf86 has it but we don't.
 

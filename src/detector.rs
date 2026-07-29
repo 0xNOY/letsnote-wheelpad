@@ -8,7 +8,7 @@ const PI2: f64 = 2.0 * PI;
 pub const TRIGGER_ANGLE: f64 = PI / 12.0;
 pub const NOISE_REJECT_ANGLE: f64 = PI / 4.0;
 pub const ZONE_RADIANS: f64 = PI / 8.0;
-pub const SAMPLE_DEADBAND_SQ: i64 = 400;
+pub const SAMPLE_DEADBAND: f64 = 20.0;
 pub const SENSITIVITY_TABLE: [i32; 5] = [10, 14, 20, 28, 40];
 
 /// Fixed at 20 to match Windows WheelPad exactly (DAT_14003cbec clamp at
@@ -24,10 +24,50 @@ pub struct TouchSample {
     pub y: i32,
 }
 
+/// Converts raw touchpad coordinates into a common X-axis coordinate space.
+///
+/// Some physically circular pads report different coordinate densities on
+/// their X and Y axes. Applying one transform to every geometric calculation
+/// keeps distances, angles, and radial gates consistent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoordinateTransform {
+    y_scale: f64,
+}
+
+impl Default for CoordinateTransform {
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
+impl CoordinateTransform {
+    pub const fn new(y_scale: f64) -> Self {
+        Self { y_scale }
+    }
+
+    fn delta(self, from: TouchSample, to: TouchSample) -> (f64, f64) {
+        (
+            to.x as f64 - from.x as f64,
+            (to.y as f64 - from.y as f64) * self.y_scale,
+        )
+    }
+
+    fn distance(self, from: TouchSample, to: TouchSample) -> f64 {
+        let (dx, dy) = self.delta(from, to);
+        dx.hypot(dy)
+    }
+
+    fn angle(self, from: TouchSample, to: TouchSample) -> f64 {
+        let (dx, dy) = self.delta(from, to);
+        dy.atan2(dx)
+    }
+}
+
 pub struct CircularDetector {
     history: VecDeque<TouchSample>,
     last_stored: Option<TouchSample>,
     accumulator: f64,
+    transform: CoordinateTransform,
 }
 
 impl Default for CircularDetector {
@@ -38,10 +78,15 @@ impl Default for CircularDetector {
 
 impl CircularDetector {
     pub fn new() -> Self {
+        Self::with_transform(CoordinateTransform::default())
+    }
+
+    pub fn with_transform(transform: CoordinateTransform) -> Self {
         Self {
             history: VecDeque::with_capacity(HISTORY_CAPACITY),
             last_stored: None,
             accumulator: 0.0,
+            transform,
         }
     }
 
@@ -56,9 +101,7 @@ impl CircularDetector {
     /// point — this is one of the verified corrections.
     pub fn push_if_moved(&mut self, s: TouchSample) {
         if let Some(prev) = self.last_stored {
-            let dx = (s.x - prev.x) as i64;
-            let dy = (s.y - prev.y) as i64;
-            if dx * dx + dy * dy <= SAMPLE_DEADBAND_SQ {
+            if self.transform.distance(prev, s) <= SAMPLE_DEADBAND {
                 return;
             }
         }
@@ -83,9 +126,7 @@ impl CircularDetector {
         // 1. Per-pair motion-vector angles.
         let mut a = Vec::with_capacity(n - 1);
         for i in 0..n - 1 {
-            let dx = (self.history[i].x - self.history[i + 1].x) as f64;
-            let dy = (self.history[i].y - self.history[i + 1].y) as f64;
-            a.push(dy.atan2(dx));
+            a.push(self.transform.angle(self.history[i + 1], self.history[i]));
         }
 
         // 2. Pairwise differences with ±2π wrap and history-truncating
@@ -164,12 +205,13 @@ pub fn engagement_swept_angle(
     center_y: i32,
     engage_start: TouchSample,
     current: TouchSample,
+    transform: CoordinateTransform,
 ) -> f64 {
-    let ax = (engage_start.x - center_x) as f64;
-    let ay = (engage_start.y - center_y) as f64;
-    let bx = (current.x - center_x) as f64;
-    let by = (current.y - center_y) as f64;
-    let mut d = by.atan2(bx) - ay.atan2(ax);
+    let center = TouchSample {
+        x: center_x,
+        y: center_y,
+    };
+    let mut d = transform.angle(center, current) - transform.angle(center, engage_start);
     if d > PI {
         d -= PI2;
     }
@@ -187,12 +229,16 @@ pub fn radial_gate_ok(
     center_y: i32,
     s: TouchSample,
     detect_area_width: i32,
+    detect_area_radius: f64,
+    transform: CoordinateTransform,
 ) -> bool {
-    let dx = (s.x - center_x) as i64;
-    let dy = (s.y - center_y) as i64;
-    let r2 = dx * dx + dy * dy;
-    let w = (10 - detect_area_width.clamp(0, 10)) as i64;
-    r2 >= (w * w) * 400
+    let center = TouchSample {
+        x: center_x,
+        y: center_y,
+    };
+    let width_fraction = (10 - detect_area_width.clamp(0, 10)) as f64 / 10.0;
+    let inner_radius = detect_area_radius * width_fraction;
+    transform.distance(center, s) >= inner_radius
 }
 
 /// Horizontal-arc test (FUN_140005a00 lines 65-74). Returns true if the
@@ -207,10 +253,13 @@ pub fn within_horizontal_arc(
     s: TouchSample,
     horizontal_start: i32,
     horizontal_end: i32,
+    transform: CoordinateTransform,
 ) -> bool {
-    let dx = (s.x - center_x) as f64;
-    let dy = (s.y - center_y) as f64;
-    let mut theta = dy.atan2(dx);
+    let center = TouchSample {
+        x: center_x,
+        y: center_y,
+    };
+    let mut theta = transform.angle(center, s);
     if theta < 0.0 {
         theta += PI2;
     }

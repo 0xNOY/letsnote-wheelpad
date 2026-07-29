@@ -65,6 +65,8 @@ horizontal_enable    = false  # 下端ウェッジでの横スクロールを有
 reverse_horizontal   = false
 sensitivity          = 0      # -2..+2 ; 小さいほど低感度
 detect_area_width    = 0      # 0..10 ; 0=外周のみ, 10=全面
+detect_area_radius   = 200.0  # width=0 時の内半径（X軸の座標単位）
+coordinate_y_scale   = 1.0    # Yに掛ける倍率。X範囲 / Y範囲を指定
 horizontal_start     = 2      # 円弧開始位置 (π/8 単位 ; 2 → 45°)
 horizontal_end       = 6      # 円弧終了位置 (π/8 単位 ; 6 → 135°)
 
@@ -80,8 +82,25 @@ level = "info"  # trace | debug | info | warn | error
 | `scroll.reverse_horizontal` | `false` | bool | |
 | `scroll.sensitivity` | `0` | -2..+2 | 倍率テーブル `[10, 14, 20, 28, 40]` のインデックス。 |
 | `scroll.detect_area_width` | `0` | 0..10 | `0`=外周のみ、`10`=全面でスクロール開始可能。 |
+| `scroll.detect_area_radius` | `200.0` | > 0 | `width=0` 時の内側デッドゾーン半径（X軸の生座標単位）。反応領域が広すぎる場合は大きくする。 |
+| `scroll.coordinate_y_scale` | `1.0` | > 0 | すべてのY方向距離に掛ける補正値。円形パッドの座標密度が縦横で異なる場合は `Xの範囲 / Yの範囲` を指定。 |
 | `scroll.horizontal_start` | `2` | 0..15 | π/8 単位。45°→135° のデフォルトはパッド下端。 |
 | `scroll.horizontal_end` | `6` | 0..15 | |
+
+### CF-SZ6（SYN0502）
+
+1台のCF-SZ6で、円形パッドが `SynPS/2 Synaptics TouchPad`、
+X=1210..5780、Y=1250..4680として報告されることを確認しました。
+次の設定で縦方向の円スクロール動作を実機確認済みです。
+
+```toml
+device_name_regex = "SynPS/2 Synaptics TouchPad"
+
+[scroll]
+detect_area_width  = 0
+detect_area_radius = 1965.0
+coordinate_y_scale = 1.33236 # (5780 - 1210) / (4680 - 1250)
+```
 
 ### ログを見る
 
@@ -94,7 +113,7 @@ journalctl --user -u letsnote-wheelpad -f
 ## 既知の制限・非対応事項
 
 - **`WheelUnderCursor` は設定不可。** Wayland ではコンポジタがフォーカス先サーフェスにイベントを配るため、ユーザランドからの上書きはできません。
-- **テスト対象は Synaptics TM3562-3 系列のみ。** 他のタッチパッドでも `device_name_regex` を変更すれば動く可能性はありますが、動作保証はしません。
+- **縦方向の円スクロールは Synaptics TM3562-3 と CF-SZ6 SYN0502 で実機検証済み。** 他のタッチパッドでも `device_name_regex` と座標補正を設定すれば動く可能性はありますが、動作保証はしません。
 - **Excel 用矢印キーフォールバックは削除。** 現代の Excel は横ホイールイベントをネイティブで処理するため、Windows 版のハックは不要です。
 - **コースティング/慣性スクロールなし。** Windows 版 WheelPad に合わせています。xf86 にはありますが、本プロジェクトでは実装しません。
 
