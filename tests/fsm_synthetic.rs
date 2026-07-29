@@ -3,7 +3,7 @@
 use std::f64::consts::PI;
 
 use letsnote_wheelpad::config::Scroll;
-use letsnote_wheelpad::detector::{CircularDetector, TouchSample};
+use letsnote_wheelpad::detector::{CircularDetector, CoordinateTransform, TouchSample};
 use letsnote_wheelpad::fsm::{Action, Fsm, FsmState, TouchFrame};
 
 fn default_scroll() -> Scroll {
@@ -22,6 +22,19 @@ fn touch(x: i32, y: i32) -> TouchFrame {
         contact: true,
         pos: Some(TouchSample { x, y }),
     }
+}
+
+fn physical_touch(
+    center_x: i32,
+    center_y: i32,
+    radius: f64,
+    angle: f64,
+    y_scale: f64,
+) -> TouchFrame {
+    touch(
+        center_x + (radius * angle.cos()).round() as i32,
+        center_y + (radius * angle.sin() / y_scale).round() as i32,
+    )
 }
 
 fn drive(
@@ -133,6 +146,88 @@ fn moving_to_scrolling_on_swept_angle_past_trigger() {
 
     drive(&mut fsm, &mut det, &scroll, &[start, end]);
     assert!(matches!(fsm.state(), FsmState::Scrolling));
+}
+
+#[test]
+fn anisotropic_coordinates_preserve_engagement_threshold_around_both_axes() {
+    const Y_SCALE: f64 = 4570.0 / 3430.0;
+    const CENTER: i32 = 5000;
+    let transform = CoordinateTransform::new(Y_SCALE);
+    let mut scroll = default_scroll();
+    scroll.detect_area_radius = 1500.0;
+    scroll.coordinate_y_scale = Y_SCALE;
+
+    for start_angle in [0.0, PI / 2.0] {
+        let mut fsm = Fsm::with_transform(CENTER, CENTER, transform);
+        let mut detector = CircularDetector::with_transform(transform);
+        let start = physical_touch(CENTER, CENTER, 2000.0, start_angle, Y_SCALE);
+        let below = physical_touch(
+            CENTER,
+            CENTER,
+            2000.0,
+            start_angle + 14.0_f64.to_radians(),
+            Y_SCALE,
+        );
+        let above = physical_touch(
+            CENTER,
+            CENTER,
+            2000.0,
+            start_angle + 16.0_f64.to_radians(),
+            Y_SCALE,
+        );
+
+        drive(&mut fsm, &mut detector, &scroll, &[start, below]);
+        assert!(
+            matches!(fsm.state(), FsmState::Moving { .. }),
+            "14° should remain below the trigger near angle {start_angle}"
+        );
+
+        drive(&mut fsm, &mut detector, &scroll, &[above]);
+        assert!(
+            matches!(fsm.state(), FsmState::Scrolling),
+            "16° should cross the trigger near angle {start_angle}"
+        );
+    }
+}
+
+#[test]
+fn anisotropic_physical_circle_matches_isotropic_fsm_ticks() {
+    const Y_SCALE: f64 = 4570.0 / 3430.0;
+    const CENTER: i32 = 5000;
+    let mut scroll = default_scroll();
+    scroll.detect_area_radius = 1500.0;
+
+    let frames_for = |y_scale: f64| {
+        (0..=40)
+            .map(|i| physical_touch(CENTER, CENTER, 2000.0, 2.0 * PI * i as f64 / 40.0, y_scale))
+            .collect::<Vec<_>>()
+    };
+    let tick_sum = |frames: &[TouchFrame], transform: CoordinateTransform, scroll: &Scroll| {
+        let mut fsm = Fsm::with_transform(CENTER, CENTER, transform);
+        let mut detector = CircularDetector::with_transform(transform);
+        drive(&mut fsm, &mut detector, scroll, frames)
+            .into_iter()
+            .map(|action| match action {
+                Action::EmitWheelV(ticks) | Action::EmitWheelH(ticks) => ticks,
+                Action::None => 0,
+            })
+            .sum::<i32>()
+    };
+
+    let expected = tick_sum(&frames_for(1.0), CoordinateTransform::default(), &scroll);
+    scroll.coordinate_y_scale = Y_SCALE;
+    let actual = tick_sum(
+        &frames_for(Y_SCALE),
+        CoordinateTransform::new(Y_SCALE),
+        &scroll,
+    );
+
+    assert_ne!(expected, 0);
+    assert_eq!(actual.signum(), expected.signum());
+    assert!(
+        (actual - expected).abs() <= 1,
+        "anisotropic={actual}, isotropic={expected}"
+    );
 }
 
 #[test]
