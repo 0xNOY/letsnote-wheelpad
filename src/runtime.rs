@@ -287,4 +287,18 @@ mod tests {
         assert_eq!(poll(&mut fds, 1_000).unwrap(), 1);
         assert!(signal.read_requested().unwrap());
     }
+
+    #[test]
+    fn pending_shutdown_remains_readable_during_nonblocking_startup_work() {
+        let mut signal = ShutdownSignal::new().unwrap();
+
+        // SAFETY: as in the poll test above, SIGINT is directed to this
+        // thread after ShutdownSignal has blocked it for signalfd.
+        let result = unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGINT) };
+        assert_eq!(result, 0);
+
+        let finite_startup_work = (0..100).sum::<usize>();
+        assert_eq!(finite_startup_work, 4_950);
+        assert!(signal.read_requested().unwrap());
+    }
 }

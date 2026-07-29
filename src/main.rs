@@ -96,7 +96,22 @@ fn run(args: Args) -> Result<()> {
     //    that window, release the grab and retry.
     let mut startup = StartupCoordinator::default();
     let mut ungrabbed = input;
+    // Discard only events already queued while the physical lifecycle
+    // still belongs to existing consumers. The FD is nonblocking, so
+    // an idle quiescent device proceeds immediately.
+    ungrabbed
+        .refresh_ungrabbed_state()
+        .map_err(|source| Error::EvdevRead { source })?;
     let mut input = loop {
+        match shutdown.read_requested() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(source) => {
+                return Err(Error::Runtime {
+                    source: LoopExit::SignalReadFailed { source },
+                });
+            }
+        }
         match startup.inspect_ungrabbed(&ungrabbed.snapshot()) {
             UngrabbedStartupAction::WaitForQuiescence => {
                 info!("waiting for touchpad contacts and buttons to be released");

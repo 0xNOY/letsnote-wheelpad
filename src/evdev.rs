@@ -7,6 +7,7 @@ use evdev::raw_stream::RawDevice;
 use evdev::{
     AbsoluteAxisType, BusType, Device, EventType, InputEvent, InputId, Key, Synchronization,
 };
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use tracing::warn;
 
 use crate::detector::TouchSample;
@@ -310,6 +311,10 @@ impl InputDevice {
             path: path.to_path_buf(),
             source,
         })?;
+        set_nonblocking(device.as_raw_fd()).map_err(|source| Error::EvdevState {
+            path: path.to_path_buf(),
+            reason: format!("failed to enable O_NONBLOCK: {source}"),
+        })?;
         validate_physical_source(path, device.input_id(), device.name())?;
         let slot_count = validate_raw_type_b(path, &device)?;
         let abs_state = device
@@ -355,19 +360,9 @@ impl InputDevice {
         self.device
             .grab()
             .map_err(|source| Error::Grab { source })?;
-        if let Err(source) = self
-            .device
-            .fetch_events()
-            .map(|events| events.for_each(drop))
-        {
-            if let Err(ungrab_source) = self.device.ungrab() {
-                warn!(
-                    %ungrab_source,
-                    "failed to release physical touchpad grab after event-drain failure"
-                );
-            }
-            return Err(Error::EvdevRead { source });
-        }
+        // Do not read here. Events delivered after EVIOCGRAB belong to
+        // the proxy lifecycle and must remain queued for normal
+        // processing. The immediate ioctl snapshot is nonblocking.
         let refreshed = match self.query_frame_state() {
             Ok(state) => state,
             Err(source) => {
@@ -396,7 +391,7 @@ impl InputDevice {
     }
 
     pub fn refresh_ungrabbed_state(&mut self) -> io::Result<()> {
-        self.device.fetch_events()?.for_each(drop);
+        drain_available_events(&mut self.device)?;
         self.pending_events.clear();
         self.state = self.query_frame_state()?;
         Ok(())
@@ -427,7 +422,11 @@ impl InputDevice {
     }
 
     pub fn poll_frames(&mut self) -> io::Result<Vec<PhysicalFrame>> {
-        let fetched = self.device.fetch_events()?.collect::<Vec<_>>();
+        let fetched = match self.device.fetch_events() {
+            Ok(events) => events.collect::<Vec<_>>(),
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => return Ok(Vec::new()),
+            Err(source) => return Err(source),
+        };
         self.pending_events.extend(fetched);
         let mut frames = Vec::new();
 
@@ -554,6 +553,37 @@ fn slot_count_from_range(path: &Path, minimum: i32, maximum: i32) -> Result<usiz
         });
     }
     Ok(count)
+}
+
+fn set_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
+    let current = fcntl(fd, FcntlArg::F_GETFL)
+        .map(OFlag::from_bits_truncate)
+        .map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
+    fcntl(fd, FcntlArg::F_SETFL(current | OFlag::O_NONBLOCK))
+        .map(|_| ())
+        .map_err(|errno| io::Error::from_raw_os_error(errno as i32))
+}
+
+trait NonblockingEventSource {
+    fn drain_batch(&mut self) -> io::Result<usize>;
+}
+
+impl NonblockingEventSource for RawDevice {
+    fn drain_batch(&mut self) -> io::Result<usize> {
+        self.fetch_events().map(Iterator::count)
+    }
+}
+
+fn drain_available_events(source: &mut impl NonblockingEventSource) -> io::Result<usize> {
+    let mut drained = 0;
+    loop {
+        match source.drain_batch() {
+            Ok(0) => return Ok(drained),
+            Ok(count) => drained += count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(drained),
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn validated_runtime_slot(value: i32, slot_count: usize) -> io::Result<usize> {
@@ -794,7 +824,39 @@ impl FrameState {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
+    use nix::unistd::{close, pipe};
+
     use super::*;
+
+    enum DrainStep {
+        Events(usize),
+        WouldBlock,
+        Error,
+    }
+
+    struct FakeEventSource {
+        steps: VecDeque<DrainStep>,
+    }
+
+    impl FakeEventSource {
+        fn new(steps: impl IntoIterator<Item = DrainStep>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+            }
+        }
+    }
+
+    impl NonblockingEventSource for FakeEventSource {
+        fn drain_batch(&mut self) -> io::Result<usize> {
+            match self.steps.pop_front().unwrap_or(DrainStep::WouldBlock) {
+                DrainStep::Events(count) => Ok(count),
+                DrainStep::WouldBlock => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                DrainStep::Error => Err(io::Error::other("read failed")),
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct VirtualTypeB {
@@ -966,6 +1028,53 @@ mod tests {
         assert!(slot_count_from_range(path, 0, 256).is_err());
         assert!(slot_count_from_range(path, 1, 4).is_err());
         assert!(slot_count_from_range(path, 0, -1).is_err());
+    }
+
+    #[test]
+    fn opening_flags_preserve_existing_status_and_add_nonblocking() {
+        let (read_fd, write_fd) = pipe().unwrap();
+        let initial = OFlag::from_bits_truncate(fcntl(read_fd, FcntlArg::F_GETFL).unwrap());
+        fcntl(read_fd, FcntlArg::F_SETFL(initial | OFlag::O_ASYNC)).unwrap();
+
+        set_nonblocking(read_fd).unwrap();
+        let final_flags = OFlag::from_bits_truncate(fcntl(read_fd, FcntlArg::F_GETFL).unwrap());
+
+        assert!(final_flags.contains(OFlag::O_NONBLOCK));
+        assert!(final_flags.contains(OFlag::O_ASYNC));
+        close(read_fd).unwrap();
+        close(write_fd).unwrap();
+    }
+
+    #[test]
+    fn ungrabbed_drain_stops_cleanly_at_would_block() {
+        let mut source = FakeEventSource::new([
+            DrainStep::Events(2),
+            DrainStep::Events(1),
+            DrainStep::WouldBlock,
+        ]);
+        assert_eq!(drain_available_events(&mut source).unwrap(), 3);
+        assert!(source.steps.is_empty());
+    }
+
+    #[test]
+    fn quiescent_startup_with_no_events_does_not_wait_for_a_read() {
+        let mut source = FakeEventSource::new([DrainStep::WouldBlock]);
+        assert_eq!(drain_available_events(&mut source).unwrap(), 0);
+        let quiet = ContactSnapshot::from_slot_values(&[(-1, 0, 0); 2], Some(1), false).unwrap();
+        let mut coordinator = StartupCoordinator::default();
+        assert_eq!(
+            coordinator.inspect_ungrabbed(&quiet),
+            UngrabbedStartupAction::AttemptGrab
+        );
+    }
+
+    #[test]
+    fn ungrabbed_drain_propagates_real_read_errors() {
+        let mut source = FakeEventSource::new([DrainStep::Error]);
+        assert_eq!(
+            drain_available_events(&mut source).unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
     }
 
     #[test]
