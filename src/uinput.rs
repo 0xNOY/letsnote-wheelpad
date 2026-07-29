@@ -27,8 +27,8 @@ use crate::error::{Error, Result};
 // --- Wheel device --------------------------------------------------------
 
 const WHEEL_NAME: &str = "Let's Note WheelPad (virtual wheel)";
-const VENDOR_ID: u16 = 0x6c6e; // ASCII "ln"
-const WHEEL_PRODUCT_ID: u16 = 0x7770; // ASCII "wp"
+pub(crate) const VENDOR_ID: u16 = 0x6c6e; // ASCII "ln"
+pub(crate) const WHEEL_PRODUCT_ID: u16 = 0x7770; // ASCII "wp"
 const VERSION: u16 = 1;
 
 /// One wheel "tick" = 120 hi-res units; same value real mice emit. Keeps
@@ -108,7 +108,7 @@ impl UinputWheel {
 
 // --- Touchpad passthrough device -----------------------------------------
 
-const TOUCHPAD_PRODUCT_ID: u16 = 0x7470; // ASCII "tp"
+pub(crate) const TOUCHPAD_PRODUCT_ID: u16 = 0x7470; // ASCII "tp"
 
 pub struct UinputTouchpad {
     dev: VirtualDevice,

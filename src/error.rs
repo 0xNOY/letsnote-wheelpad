@@ -29,6 +29,12 @@ pub enum Error {
     #[error("could not find a touchpad matching `{regex}`. Set `device = \"/dev/input/eventN\"` in the config to override.")]
     DeviceNotFound { regex: String },
 
+    #[error("multiple physical touchpads match `{regex}`; specify `--device` explicitly. Candidates:\n{candidates}")]
+    DeviceAmbiguous { regex: String, candidates: String },
+
+    #[error("refusing virtual input source {path:?} ({name})")]
+    VirtualInputSource { path: PathBuf, name: String },
+
     #[error("failed to open evdev device {path:?}: {source}")]
     EvdevOpen { path: PathBuf, source: io::Error },
 

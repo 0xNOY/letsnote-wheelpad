@@ -6,12 +6,13 @@ use std::io;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
-use evdev::{AbsoluteAxisType, Device, EventType, InputEvent, Key};
+use evdev::{AbsoluteAxisType, BusType, Device, EventType, InputEvent, InputId, Key};
 use tracing::warn;
 
 use crate::detector::TouchSample;
 use crate::error::{Error, Result};
 use crate::fsm::{ContactId, TouchFrame};
+use crate::uinput::{TOUCHPAD_PRODUCT_ID, VENDOR_ID, WHEEL_PRODUCT_ID};
 
 /// Maximum number of MT slots we track. The kernel exposes up to 10 in
 /// practice; touchpads typically advertise 5. We sweep all slots when
@@ -156,6 +157,7 @@ impl InputDevice {
             path: path.to_path_buf(),
             source,
         })?;
+        validate_physical_source(path, &device)?;
 
         // Required capabilities.
         let abs = device.supported_absolute_axes();
@@ -228,23 +230,21 @@ impl InputDevice {
         })
     }
 
-    /// Find a touchpad whose name matches `regex`. Returns the first match
-    /// found via `/dev/input/event*` enumeration.
+    /// Find the unique physical touchpad whose name matches `regex`.
     pub fn find_by_name(regex_str: &str) -> Result<PathBuf> {
         let re = regex::Regex::new(regex_str).map_err(|source| Error::RegexInvalid {
             pattern: regex_str.to_string(),
             source,
         })?;
+        let mut candidates = Vec::new();
         for (path, device) in evdev::enumerate() {
             if let Some(name) = device.name() {
-                if re.is_match(name) {
-                    return Ok(path);
+                if re.is_match(name) && !is_virtual_source(&device.input_id(), name) {
+                    candidates.push((path, name.to_string()));
                 }
             }
         }
-        Err(Error::DeviceNotFound {
-            regex: regex_str.to_string(),
-        })
+        select_candidate(regex_str, candidates)
     }
 
     /// Block until events are available, then return ALL complete
@@ -280,6 +280,44 @@ impl InputDevice {
         }
         Ok(frames)
     }
+}
+
+fn select_candidate(regex_str: &str, mut candidates: Vec<(PathBuf, String)>) -> Result<PathBuf> {
+    match candidates.len() {
+        0 => Err(Error::DeviceNotFound {
+            regex: regex_str.to_string(),
+        }),
+        1 => Ok(candidates.pop().unwrap().0),
+        _ => {
+            let candidates = candidates
+                .into_iter()
+                .map(|(path, name)| format!("  {} — {name}", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(Error::DeviceAmbiguous {
+                regex: regex_str.to_string(),
+                candidates,
+            })
+        }
+    }
+}
+
+fn validate_physical_source(path: &Path, device: &Device) -> Result<()> {
+    let name = device.name().unwrap_or("<unnamed>");
+    if is_virtual_source(&device.input_id(), name) {
+        return Err(Error::VirtualInputSource {
+            path: path.to_path_buf(),
+            name: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn is_virtual_source(id: &InputId, name: &str) -> bool {
+    id.bus_type() == BusType::BUS_VIRTUAL
+        || (id.vendor() == VENDOR_ID
+            && matches!(id.product(), WHEEL_PRODUCT_ID | TOUCHPAD_PRODUCT_ID))
+        || name.contains("(letsnote-wheelpad)")
 }
 
 impl FrameState {
@@ -388,5 +426,37 @@ mod tests {
         set_contact(&mut state, 3, 31, 700, 400);
 
         assert!(!state.snapshot().for_contact(tracked).contact);
+    }
+
+    #[test]
+    fn virtual_source_detection_covers_bus_ids_and_name() {
+        let physical = InputId::new(BusType::BUS_I2C, 1, 2, 1);
+        let virtual_bus = InputId::new(BusType::BUS_VIRTUAL, 1, 2, 1);
+        let own_ids = InputId::new(BusType::BUS_I2C, VENDOR_ID, TOUCHPAD_PRODUCT_ID, 1);
+
+        assert!(!is_virtual_source(&physical, "Synaptics TM3562"));
+        assert!(is_virtual_source(&virtual_bus, "Synaptics TM3562"));
+        assert!(is_virtual_source(&own_ids, "renamed device"));
+        assert!(is_virtual_source(
+            &physical,
+            "Synaptics TM3562 (letsnote-wheelpad)"
+        ));
+    }
+
+    #[test]
+    fn multiple_physical_candidates_are_reported_instead_of_selected() {
+        let result = select_candidate(
+            "TM3562",
+            vec![
+                (PathBuf::from("/dev/input/event4"), "Touchpad A".into()),
+                (PathBuf::from("/dev/input/event7"), "Touchpad B".into()),
+            ],
+        );
+
+        let Error::DeviceAmbiguous { candidates, .. } = result.unwrap_err() else {
+            panic!("expected ambiguous-device error");
+        };
+        assert!(candidates.contains("/dev/input/event4 — Touchpad A"));
+        assert!(candidates.contains("/dev/input/event7 — Touchpad B"));
     }
 }
