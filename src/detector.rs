@@ -61,6 +61,20 @@ impl CoordinateTransform {
         let (dx, dy) = self.delta(from, to);
         dy.atan2(dx)
     }
+
+    fn circumradius(self, a: TouchSample, b: TouchSample, c: TouchSample) -> f64 {
+        let (ab_x, ab_y) = self.delta(a, b);
+        let (ac_x, ac_y) = self.delta(a, c);
+        let twice_area = (ab_x * ac_y - ab_y * ac_x).abs();
+        if twice_area <= f64::EPSILON {
+            return f64::INFINITY;
+        }
+
+        let ab = ab_x.hypot(ab_y);
+        let ac = ac_x.hypot(ac_y);
+        let bc = self.distance(b, c);
+        ab * ac * bc / (2.0 * twice_area)
+    }
 }
 
 pub struct CircularDetector {
@@ -68,6 +82,7 @@ pub struct CircularDetector {
     last_stored: Option<TouchSample>,
     accumulator: f64,
     transform: CoordinateTransform,
+    minimum_rotation_radius: f64,
 }
 
 impl Default for CircularDetector {
@@ -82,11 +97,16 @@ impl CircularDetector {
     }
 
     pub fn with_transform(transform: CoordinateTransform) -> Self {
+        Self::with_geometry(transform, 0.0)
+    }
+
+    pub fn with_geometry(transform: CoordinateTransform, minimum_rotation_radius: f64) -> Self {
         Self {
             history: VecDeque::with_capacity(HISTORY_CAPACITY),
             last_stored: None,
             accumulator: 0.0,
             transform,
+            minimum_rotation_radius,
         }
     }
 
@@ -142,6 +162,16 @@ impl CircularDetector {
                 d += PI2;
             }
             if d.abs() > NOISE_REJECT_ANGLE {
+                valid = i;
+                break;
+            }
+            if self.minimum_rotation_radius > 0.0
+                && self.transform.circumradius(
+                    self.history[i],
+                    self.history[i + 1],
+                    self.history[i + 2],
+                ) < self.minimum_rotation_radius
+            {
                 valid = i;
                 break;
             }

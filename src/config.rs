@@ -25,6 +25,7 @@ pub struct Scroll {
     pub detect_area_width: i32,
     pub detect_area_radius: f64,
     pub coordinate_y_scale: f64,
+    pub minimum_rotation_radius: f64,
     pub horizontal_start: i32,
     pub horizontal_end: i32,
 }
@@ -60,6 +61,7 @@ impl Default for Scroll {
             detect_area_width: 0,
             detect_area_radius: 200.0,
             coordinate_y_scale: 1.0,
+            minimum_rotation_radius: 0.0,
             horizontal_start: 2,
             horizontal_end: 6,
         }
@@ -127,6 +129,13 @@ impl Config {
                 expected: "a finite value greater than 0",
             });
         }
+        if !s.minimum_rotation_radius.is_finite() || s.minimum_rotation_radius < 0.0 {
+            return Err(Error::ConfigFloatRange {
+                key: "scroll.minimum_rotation_radius",
+                value: s.minimum_rotation_radius,
+                expected: "a finite value greater than or equal to 0",
+            });
+        }
         if !(0..=15).contains(&s.horizontal_start) {
             return Err(Error::ConfigRange {
                 key: "scroll.horizontal_start",
@@ -176,6 +185,7 @@ mod tests {
         assert_eq!(c.scroll.detect_area_width, 0);
         assert_eq!(c.scroll.detect_area_radius, 200.0);
         assert_eq!(c.scroll.coordinate_y_scale, 1.0);
+        assert_eq!(c.scroll.minimum_rotation_radius, 0.0);
         assert_eq!(c.scroll.horizontal_start, 2);
         assert_eq!(c.scroll.horizontal_end, 6);
     }
@@ -194,6 +204,7 @@ mod tests {
         assert_eq!(c.scroll.horizontal_start, 2);
         assert_eq!(c.scroll.detect_area_radius, 200.0);
         assert_eq!(c.scroll.coordinate_y_scale, 1.0);
+        assert_eq!(c.scroll.minimum_rotation_radius, 0.0);
     }
 
     #[test]
@@ -211,6 +222,10 @@ mod tests {
 
         c.scroll.detect_area_radius = 200.0;
         c.scroll.coordinate_y_scale = f64::NAN;
+        assert!(c.validate().is_err());
+
+        c.scroll.coordinate_y_scale = 1.0;
+        c.scroll.minimum_rotation_radius = -1.0;
         assert!(c.validate().is_err());
     }
 }

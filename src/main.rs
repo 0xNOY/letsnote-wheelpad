@@ -105,7 +105,8 @@ fn run(args: Args) -> Result<()> {
     // 6. Build the algorithm and FSM. History capacity is fixed at 20
     //    to match Windows WheelPad exactly (D-021-followup).
     let transform = CoordinateTransform::new(config.scroll.coordinate_y_scale);
-    let mut detector = CircularDetector::with_transform(transform);
+    let mut detector =
+        CircularDetector::with_geometry(transform, config.scroll.minimum_rotation_radius);
     let mut fsm = Fsm::with_transform(input.center_x, input.center_y, transform);
 
     // 7. Signal handling.
