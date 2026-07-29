@@ -16,7 +16,7 @@ use crate::fsm::{ContactId, TouchFrame};
 use crate::uinput::{TOUCHPAD_PRODUCT_ID, VENDOR_ID, WHEEL_PRODUCT_ID};
 
 const INACTIVE_TRACKING_ID: i32 = -1;
-const MAX_SUPPORTED_MT_SLOTS: usize = 256;
+const MAX_SUPPORTED_MT_SLOTS: usize = 100;
 const TOUCHPAD_BUTTONS: [Key; 8] = [
     Key::BTN_LEFT,
     Key::BTN_RIGHT,
@@ -553,7 +553,7 @@ fn slot_count_from_range(path: &Path, minimum: i32, maximum: i32) -> Result<usiz
             path: path.to_path_buf(),
             minimum,
             maximum,
-            expected: "at most 256 slots",
+            expected: "uinput-compatible range 0..99 (at most 100 slots)",
         });
     }
     Ok(count)
@@ -1028,8 +1028,9 @@ mod tests {
     #[test]
     fn advertised_slot_range_is_validated() {
         let path = Path::new("/dev/input/test");
-        assert_eq!(slot_count_from_range(path, 0, 255).unwrap(), 256);
-        assert!(slot_count_from_range(path, 0, 256).is_err());
+        assert_eq!(slot_count_from_range(path, 0, 99).unwrap(), 100);
+        let error = slot_count_from_range(path, 0, 100).unwrap_err();
+        assert!(error.to_string().contains("0..99"));
         assert!(slot_count_from_range(path, 1, 4).is_err());
         assert!(slot_count_from_range(path, 0, -1).is_err());
     }
