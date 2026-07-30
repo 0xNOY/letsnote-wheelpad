@@ -6,7 +6,7 @@ use nix::poll::{poll, PollFd, PollFlags};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use letsnote_wheelpad::config::Config;
+use letsnote_wheelpad::config::{Config, ConfigRequest, ConfigSource, LoadedConfig};
 use letsnote_wheelpad::detector::CoordinateTransform;
 use letsnote_wheelpad::error::{Error, Result};
 use letsnote_wheelpad::evdev::{
@@ -48,12 +48,25 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<()> {
-    let config_path = args.config.unwrap_or_else(Config::default_path);
-    let config = Config::load(&config_path)?;
+    let config_request = match args.config {
+        Some(path) => ConfigRequest::Explicit(path),
+        None => ConfigRequest::ImplicitDefault(Config::default_path()),
+    };
+    let LoadedConfig { config, source } = Config::load(config_request)?;
 
     init_tracing(&config, args.debug);
 
-    info!(?config_path, "config loaded");
+    match source {
+        ConfigSource::File(path) => {
+            info!(path = %path.display(), "config file loaded");
+        }
+        ConfigSource::CompiledDefaults { missing_path } => {
+            warn!(
+                path = %missing_path.display(),
+                "implicit config file not found; using compiled defaults"
+            );
+        }
+    }
     debug!(?config, "effective config");
 
     // Block shutdown signals before any resource is grabbed. signalfd

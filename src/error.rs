@@ -90,7 +90,7 @@ pub enum Error {
     #[error("signal handling setup failed: {source}")]
     Signal { source: nix::errno::Errno },
 
-    #[error("XDG runtime directory is unavailable for the instance lock: {reason}")]
+    #[error("runtime directory is unavailable for the instance lock: {reason}")]
     RuntimeDirUnavailable { reason: String },
 
     #[error("failed to identify physical device {path:?} for locking: {source}")]

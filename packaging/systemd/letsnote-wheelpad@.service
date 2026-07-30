@@ -1,0 +1,25 @@
+[Unit]
+Description=Let's Note WheelPad for /dev/input/%I
+Documentation=https://github.com/0xNOY/letsnote-wheelpad
+ConditionPathExists=/etc/letsnote-wheelpad/system-service-enabled
+BindsTo=dev-input-%i.device
+After=dev-input-%i.device systemd-udevd.service
+Before=display-manager.service
+StartLimitIntervalSec=30s
+StartLimitBurst=5
+
+[Service]
+Type=notify
+User=letsnote-wheelpad
+Group=letsnote-wheelpad
+ExecStart=/usr/bin/letsnote-wheelpad --config /etc/letsnote-wheelpad/config.toml --device /dev/input/%I
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=10s
+
+RuntimeDirectory=letsnote-wheelpad/%I
+RuntimeDirectoryMode=0700
+UMask=0077
+
+StandardOutput=journal
+StandardError=journal
