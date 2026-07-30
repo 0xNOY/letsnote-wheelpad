@@ -1,6 +1,8 @@
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -96,41 +98,119 @@ impl InstanceLock {
 }
 
 fn runtime_directory() -> Result<PathBuf> {
-    let value =
-        std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| Error::RuntimeDirUnavailable {
-            reason: "XDG_RUNTIME_DIR is not set".to_string(),
-        })?;
-    let configured = PathBuf::from(value);
-    if !configured.is_absolute() {
-        return Err(Error::RuntimeDirUnavailable {
-            reason: format!("{} is not an absolute path", configured.display()),
-        });
-    }
-    let path = fs::canonicalize(&configured).map_err(|source| Error::RuntimeDirUnavailable {
-        reason: format!("{}: {source}", configured.display()),
-    })?;
-    let metadata = fs::metadata(&path).map_err(|source| Error::RuntimeDirUnavailable {
-        reason: format!("{}: {source}", path.display()),
-    })?;
-    if !metadata.is_dir() {
-        return Err(Error::RuntimeDirUnavailable {
-            reason: format!("{} is not a directory", path.display()),
-        });
+    let runtime_directory = std::env::var_os("RUNTIME_DIRECTORY");
+    let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
+    resolve_runtime_directory(
+        runtime_directory.as_deref(),
+        xdg_runtime_dir.as_deref(),
+        effective_uid(),
+    )
+}
+
+fn resolve_runtime_directory(
+    runtime_directory: Option<&OsStr>,
+    xdg_runtime_dir: Option<&OsStr>,
+    effective_uid: u32,
+) -> Result<PathBuf> {
+    if let Some(value) = runtime_directory {
+        return validate_runtime_directory("RUNTIME_DIRECTORY", value, effective_uid);
     }
 
-    // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let effective_uid = unsafe { libc::geteuid() };
-    if metadata.uid() != effective_uid {
-        return Err(Error::RuntimeDirUnavailable {
-            reason: format!("{} is not owned by the current user", path.display()),
-        });
+    let value = xdg_runtime_dir.ok_or_else(|| Error::RuntimeDirUnavailable {
+        reason: "RUNTIME_DIRECTORY and XDG_RUNTIME_DIR are not set".to_string(),
+    })?;
+    validate_runtime_directory("XDG_RUNTIME_DIR", value, effective_uid)
+}
+
+fn validate_runtime_directory(
+    source_variable: &'static str,
+    value: &OsStr,
+    effective_uid: u32,
+) -> Result<PathBuf> {
+    if value.is_empty() {
+        return Err(runtime_directory_error(
+            source_variable,
+            "value is empty".to_string(),
+        ));
     }
-    if metadata.mode() & 0o022 != 0 {
-        return Err(Error::RuntimeDirUnavailable {
-            reason: format!("{} is writable by another user or group", path.display()),
-        });
+    if source_variable == "RUNTIME_DIRECTORY" && value.as_bytes().contains(&b':') {
+        return Err(runtime_directory_error(
+            source_variable,
+            "multiple colon-separated paths are not supported".to_string(),
+        ));
     }
+
+    let configured = PathBuf::from(value);
+    if !configured.is_absolute() {
+        return Err(runtime_directory_error(
+            source_variable,
+            format!("{} is not an absolute path", configured.display()),
+        ));
+    }
+    let path = fs::canonicalize(&configured).map_err(|source| {
+        runtime_directory_error(
+            source_variable,
+            format!("cannot canonicalize {}: {source}", configured.display()),
+        )
+    })?;
+    let metadata = fs::metadata(&path).map_err(|source| {
+        runtime_directory_error(
+            source_variable,
+            format!("cannot inspect {}: {source}", path.display()),
+        )
+    })?;
+    validate_runtime_directory_metadata(
+        source_variable,
+        &path,
+        metadata.is_dir(),
+        metadata.uid(),
+        metadata.mode(),
+        effective_uid,
+    )?;
     Ok(path)
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    unsafe { libc::geteuid() }
+}
+
+fn validate_runtime_directory_metadata(
+    source_variable: &'static str,
+    path: &Path,
+    is_directory: bool,
+    owner_uid: u32,
+    mode: u32,
+    effective_uid: u32,
+) -> Result<()> {
+    if !is_directory {
+        return Err(runtime_directory_error(
+            source_variable,
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+    if owner_uid != effective_uid {
+        return Err(runtime_directory_error(
+            source_variable,
+            format!(
+                "{} is owned by UID {owner_uid}, not effective UID {effective_uid}",
+                path.display()
+            ),
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Err(runtime_directory_error(
+            source_variable,
+            format!("{} is group- or world-writable", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn runtime_directory_error(source_variable: &'static str, reason: String) -> Error {
+    Error::RuntimeDirUnavailable {
+        reason: format!("{source_variable}: {reason}"),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -183,6 +263,8 @@ impl LoopExit {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use nix::poll::{poll, PollFd, PollFlags};
@@ -216,6 +298,150 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn resolve(
+        runtime_directory: Option<&OsStr>,
+        xdg_runtime_dir: Option<&OsStr>,
+    ) -> Result<PathBuf> {
+        resolve_runtime_directory(runtime_directory, xdg_runtime_dir, effective_uid())
+    }
+
+    fn error_message(error: Error) -> String {
+        error.to_string()
+    }
+
+    #[test]
+    fn valid_runtime_directory_is_used() {
+        let temp = TestTempDir::new();
+
+        assert_eq!(
+            resolve(Some(temp.path.as_os_str()), None).unwrap(),
+            fs::canonicalize(&temp.path).unwrap()
+        );
+    }
+
+    #[test]
+    fn runtime_directory_takes_priority_over_xdg_runtime_dir() {
+        let runtime = TestTempDir::new();
+        let xdg = TestTempDir::new();
+
+        assert_eq!(
+            resolve(Some(runtime.path.as_os_str()), Some(xdg.path.as_os_str())).unwrap(),
+            fs::canonicalize(&runtime.path).unwrap()
+        );
+    }
+
+    #[test]
+    fn xdg_runtime_dir_is_used_when_runtime_directory_is_unset() {
+        let xdg = TestTempDir::new();
+
+        assert_eq!(
+            resolve(None, Some(xdg.path.as_os_str())).unwrap(),
+            fs::canonicalize(&xdg.path).unwrap()
+        );
+    }
+
+    #[test]
+    fn runtime_directory_rejects_relative_paths() {
+        let message = error_message(resolve(Some(OsStr::new("relative")), None).unwrap_err());
+
+        assert!(message.contains("RUNTIME_DIRECTORY"));
+        assert!(message.contains("not an absolute path"));
+    }
+
+    #[test]
+    fn runtime_directory_rejects_colon_separated_paths() {
+        let message =
+            error_message(resolve(Some(OsStr::new("/run/first:/run/second")), None).unwrap_err());
+
+        assert!(message.contains("RUNTIME_DIRECTORY"));
+        assert!(message.contains("colon-separated"));
+    }
+
+    #[test]
+    fn runtime_directory_rejects_wrong_owner_metadata() {
+        let error = validate_runtime_directory_metadata(
+            "RUNTIME_DIRECTORY",
+            Path::new("/run/example"),
+            true,
+            1001,
+            0o40700,
+            1000,
+        )
+        .unwrap_err();
+        let message = error_message(error);
+
+        assert!(message.contains("RUNTIME_DIRECTORY"));
+        assert!(message.contains("UID 1001"));
+        assert!(message.contains("effective UID 1000"));
+    }
+
+    #[test]
+    fn runtime_directory_rejects_group_or_world_writable_directory() {
+        let temp = TestTempDir::new();
+        fs::set_permissions(&temp.path, fs::Permissions::from_mode(0o722)).unwrap();
+
+        let message = error_message(resolve(Some(temp.path.as_os_str()), None).unwrap_err());
+
+        assert!(message.contains("RUNTIME_DIRECTORY"));
+        assert!(message.contains("group- or world-writable"));
+    }
+
+    #[test]
+    fn runtime_directory_rejects_missing_directory() {
+        let temp = TestTempDir::new();
+        let missing = temp.path.join("missing");
+
+        let message = error_message(resolve(Some(missing.as_os_str()), None).unwrap_err());
+
+        assert!(message.contains("RUNTIME_DIRECTORY"));
+        assert!(message.contains("cannot canonicalize"));
+    }
+
+    #[test]
+    fn runtime_directory_rejects_non_directory() {
+        let temp = TestTempDir::new();
+        let file = temp.path.join("file");
+        File::create(&file).unwrap();
+
+        let message = error_message(resolve(Some(file.as_os_str()), None).unwrap_err());
+
+        assert!(message.contains("RUNTIME_DIRECTORY"));
+        assert!(message.contains("not a directory"));
+    }
+
+    #[test]
+    fn runtime_directory_rejects_empty_value() {
+        let message = error_message(resolve(Some(OsStr::new("")), None).unwrap_err());
+
+        assert!(message.contains("RUNTIME_DIRECTORY"));
+        assert!(message.contains("empty"));
+    }
+
+    #[test]
+    fn invalid_runtime_directory_does_not_fall_back_to_xdg() {
+        let xdg = TestTempDir::new();
+
+        let message = error_message(
+            resolve(Some(OsStr::new("invalid")), Some(xdg.path.as_os_str())).unwrap_err(),
+        );
+
+        assert!(message.contains("RUNTIME_DIRECTORY"));
+        assert!(message.contains("invalid is not an absolute path"));
+    }
+
+    #[test]
+    fn runtime_directory_uses_canonicalized_symlink_target() {
+        let target = TestTempDir::new();
+        let links = TestTempDir::new();
+        let link = links.path.join("runtime");
+        symlink(&target.path, &link).unwrap();
+
+        assert_eq!(
+            resolve(Some(link.as_os_str()), None).unwrap(),
+            fs::canonicalize(&target.path).unwrap()
+        );
     }
 
     #[test]
