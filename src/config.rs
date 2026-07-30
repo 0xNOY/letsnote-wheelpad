@@ -1,9 +1,27 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigRequest {
+    Explicit(PathBuf),
+    ImplicitDefault(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    File(PathBuf),
+    CompiledDefaults { missing_path: PathBuf },
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub source: ConfigSource,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -77,18 +95,28 @@ impl Default for Log {
 }
 
 impl Config {
-    /// Load from a TOML file. Missing file → defaults (warned by caller).
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn load(request: ConfigRequest) -> Result<LoadedConfig> {
+        let path = match &request {
+            ConfigRequest::Explicit(path) | ConfigRequest::ImplicitDefault(path) => path,
+        };
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => match request {
+                ConfigRequest::ImplicitDefault(missing_path) => {
+                    return Ok(LoadedConfig {
+                        config: Self::default(),
+                        source: ConfigSource::CompiledDefaults { missing_path },
+                    });
+                }
+                ConfigRequest::Explicit(path) => {
+                    return Err(Error::ConfigIo { path, source });
+                }
+            },
             Err(source) => {
-                return Err(Error::ConfigIo {
-                    path: path.to_path_buf(),
-                    source,
-                });
+                let path = match request {
+                    ConfigRequest::Explicit(path) | ConfigRequest::ImplicitDefault(path) => path,
+                };
+                return Err(Error::ConfigIo { path, source });
             }
         };
         let cfg: Config = toml::from_str(&text).map_err(|source| Error::ConfigParse {
@@ -96,7 +124,13 @@ impl Config {
             source,
         })?;
         cfg.validate()?;
-        Ok(cfg)
+        let path = match request {
+            ConfigRequest::Explicit(path) | ConfigRequest::ImplicitDefault(path) => path,
+        };
+        Ok(LoadedConfig {
+            config: cfg,
+            source: ConfigSource::File(path),
+        })
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -173,7 +207,39 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new() -> Self {
+            loop {
+                let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "letsnote-wheelpad-config-test-{}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self { path },
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("failed to create test temp directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn defaults_match_windows() {
@@ -227,5 +293,112 @@ mod tests {
         c.scroll.coordinate_y_scale = 1.0;
         c.scroll.minimum_rotation_radius = -1.0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_existing_file_is_loaded() {
+        let temp = TestTempDir::new();
+        let path = temp.path.join("explicit.toml");
+        fs::write(&path, "[scroll]\nsensitivity = -1\n").unwrap();
+
+        let loaded = Config::load(ConfigRequest::Explicit(path.clone())).unwrap();
+
+        assert_eq!(loaded.config.scroll.sensitivity, -1);
+        assert_eq!(loaded.source, ConfigSource::File(path));
+    }
+
+    #[test]
+    fn explicit_missing_file_is_fatal_and_returns_no_defaults() {
+        let temp = TestTempDir::new();
+        let path = temp.path.join("missing.toml");
+
+        let error = Config::load(ConfigRequest::Explicit(path.clone())).unwrap_err();
+
+        match error {
+            Error::ConfigIo {
+                path: error_path,
+                source,
+            } => {
+                assert_eq!(error_path, path);
+                assert_eq!(source.kind(), io::ErrorKind::NotFound);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn implicit_existing_file_is_loaded() {
+        let temp = TestTempDir::new();
+        let path = temp.path.join("implicit.toml");
+        fs::write(&path, "[scroll]\nhorizontal_enable = true\n").unwrap();
+
+        let loaded = Config::load(ConfigRequest::ImplicitDefault(path.clone())).unwrap();
+
+        assert!(loaded.config.scroll.horizontal_enable);
+        assert_eq!(loaded.source, ConfigSource::File(path));
+    }
+
+    #[test]
+    fn implicit_missing_file_uses_compiled_defaults() {
+        let temp = TestTempDir::new();
+        let path = temp.path.join("missing.toml");
+
+        let loaded = Config::load(ConfigRequest::ImplicitDefault(path)).unwrap();
+
+        assert_eq!(
+            loaded.config.scroll.sensitivity,
+            Config::default().scroll.sensitivity
+        );
+        assert_eq!(
+            loaded.config.device_name_regex,
+            Config::default().device_name_regex
+        );
+    }
+
+    #[test]
+    fn implicit_missing_file_reports_compiled_default_source() {
+        let temp = TestTempDir::new();
+        let path = temp.path.join("missing.toml");
+
+        let loaded = Config::load(ConfigRequest::ImplicitDefault(path.clone())).unwrap();
+
+        assert_eq!(
+            loaded.source,
+            ConfigSource::CompiledDefaults { missing_path: path }
+        );
+    }
+
+    #[test]
+    fn config_parse_error_is_fatal() {
+        let temp = TestTempDir::new();
+        let path = temp.path.join("invalid.toml");
+        fs::write(&path, "[scroll\n").unwrap();
+
+        let error = Config::load(ConfigRequest::ImplicitDefault(path.clone())).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::ConfigParse {
+                path: error_path,
+                ..
+            } if error_path == path
+        ));
+    }
+
+    #[test]
+    fn config_range_error_is_fatal() {
+        let temp = TestTempDir::new();
+        let path = temp.path.join("out-of-range.toml");
+        fs::write(&path, "[scroll]\nsensitivity = 3\n").unwrap();
+
+        let error = Config::load(ConfigRequest::Explicit(path)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::ConfigRange {
+                key: "scroll.sensitivity",
+                ..
+            }
+        ));
     }
 }
