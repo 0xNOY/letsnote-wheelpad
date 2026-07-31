@@ -1,0 +1,35 @@
+# Dedicated access to the global uinput control node.
+ACTION=="add|change", SUBSYSTEM=="misc", KERNEL=="uinput", \
+    MODE="0660", GROUP="letsnote-wheelpad", TAG-="uaccess", \
+    OPTIONS+="static_node=uinput"
+
+# Do not expose daemon-generated virtual devices through per-session uaccess ACLs.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", \
+    ATTRS{id/bustype}=="0006", ATTRS{id/vendor}=="6c6e", \
+    ATTRS{id/product}=="7470", TAG-="uaccess"
+
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", \
+    ATTRS{id/bustype}=="0006", ATTRS{id/vendor}=="6c6e", \
+    ATTRS{id/product}=="7770", TAG-="uaccess"
+
+# Supported Synaptics TM3562 physical touchpads.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", \
+    ENV{ID_INPUT_TOUCHPAD}=="1", ATTRS{id/bustype}!="0006", \
+    ATTRS{name}=="*TM3562*", \
+    MODE="0660", GROUP="letsnote-wheelpad", TAG-="uaccess", \
+    TAG+="systemd", \
+    ENV{SYSTEMD_WANTS}+="letsnote-wheelpad@%k.service"
+
+# Observed Panasonic CF-SZ6 physical touchpad.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", \
+    ENV{ID_INPUT_TOUCHPAD}=="1", \
+    ATTRS{id/bustype}=="0011", ATTRS{id/vendor}=="0002", \
+    ATTRS{id/product}=="0007", \
+    ATTRS{name}=="SynPS/2 Synaptics TouchPad", \
+    MODE="0660", GROUP="letsnote-wheelpad", TAG-="uaccess", \
+    TAG+="systemd", \
+    ENV{SYSTEMD_WANTS}+="letsnote-wheelpad@%k.service"
+
+# Removing the uaccess tag prevents subsequent packaged uaccess ACL grants.
+# One-time cleanup of named ACLs left by an earlier package belongs to package
+# migration; do not run an external ACL helper for each device event.

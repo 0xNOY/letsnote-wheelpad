@@ -12,10 +12,13 @@ StartLimitBurst=5
 Type=notify
 User=letsnote-wheelpad
 Group=letsnote-wheelpad
+DevicePolicy=closed
+DeviceAllow=/dev/input/%I rw
+DeviceAllow=/dev/uinput rw
 ExecStart=/usr/bin/letsnote-wheelpad --config /etc/letsnote-wheelpad/config.toml --device /dev/input/%I
 Restart=on-failure
 RestartSec=2s
-TimeoutStartSec=10s
+TimeoutStartSec=infinity
 
 RuntimeDirectory=letsnote-wheelpad/%I
 RuntimeDirectoryMode=0700
