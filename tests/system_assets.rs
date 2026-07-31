@@ -143,6 +143,10 @@ fn udev_rules_preserve_device_isolation() {
 #[test]
 fn system_service_allows_only_the_instance_and_uinput() {
     let contents = repository_file("packaging/systemd/letsnote-wheelpad@.service");
+    let timeout_start_directives: Vec<_> = contents
+        .lines()
+        .filter(|line| line.starts_with("TimeoutStartSec="))
+        .collect();
 
     assert!(contents
         .lines()
@@ -157,6 +161,10 @@ fn system_service_allows_only_the_instance_and_uinput() {
     assert!(contents
         .lines()
         .any(|line| line == "DeviceAllow=/dev/uinput rw"));
+    assert_eq!(timeout_start_directives, ["TimeoutStartSec=infinity"]);
+    assert!(!contents.lines().any(|line| line == "TimeoutStartSec=10s"));
+    assert!(contents.lines().any(|line| line == "Type=notify"));
+    assert!(contents.lines().any(|line| line == "Restart=on-failure"));
     assert!(!contents.contains("DeviceAllow=/dev/input/*"));
     assert!(!contents.lines().any(|line| line.trim() == "[Install]"));
     assert!(!contents.contains("DynamicUser"));
