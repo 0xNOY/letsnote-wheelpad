@@ -178,12 +178,80 @@ fn system_service_allows_only_the_instance_and_uinput() {
 }
 
 #[test]
-fn new_system_assets_are_not_yet_packaged() {
+fn package_config_matches_compiled_defaults() {
+    use letsnote_wheelpad::config::{Config, ConfigRequest, ConfigSource};
+
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("packaging/config/letsnote-wheelpad.toml");
+    let loaded = Config::load(ConfigRequest::Explicit(path.clone()))
+        .expect("package config must parse and validate");
+    assert_eq!(loaded.source, ConfigSource::File(path));
+
+    let actual = loaded.config;
+    let expected = Config::default();
+    assert_eq!(actual.device, expected.device);
+    assert_eq!(actual.device_name_regex, expected.device_name_regex);
+    assert_eq!(actual.scroll.enable, expected.scroll.enable);
+    assert_eq!(
+        actual.scroll.reverse_vertical,
+        expected.scroll.reverse_vertical
+    );
+    assert_eq!(
+        actual.scroll.horizontal_enable,
+        expected.scroll.horizontal_enable
+    );
+    assert_eq!(
+        actual.scroll.reverse_horizontal,
+        expected.scroll.reverse_horizontal
+    );
+    assert_eq!(actual.scroll.sensitivity, expected.scroll.sensitivity);
+    assert_eq!(
+        actual.scroll.detect_area_width,
+        expected.scroll.detect_area_width
+    );
+    assert_eq!(
+        actual.scroll.detect_area_radius,
+        expected.scroll.detect_area_radius
+    );
+    assert_eq!(
+        actual.scroll.coordinate_y_scale,
+        expected.scroll.coordinate_y_scale
+    );
+    assert_eq!(
+        actual.scroll.minimum_rotation_radius,
+        expected.scroll.minimum_rotation_radius
+    );
+    assert_eq!(
+        actual.scroll.horizontal_start,
+        expected.scroll.horizontal_start
+    );
+    assert_eq!(actual.scroll.horizontal_end, expected.scroll.horizontal_end);
+    assert_eq!(actual.log.level, expected.log.level);
+}
+
+#[test]
+fn inert_system_assets_are_packaged_for_debian_and_rpm() {
     let cargo_toml = repository_file("Cargo.toml");
 
-    assert!(!cargo_toml.contains("packaging/sysusers/letsnote-wheelpad.conf"));
+    assert_eq!(
+        cargo_toml
+            .matches("packaging/sysusers/letsnote-wheelpad.conf")
+            .count(),
+        2
+    );
+    assert_eq!(
+        cargo_toml
+            .matches("packaging/systemd/letsnote-wheelpad@.service")
+            .count(),
+        2
+    );
+    assert_eq!(
+        cargo_toml
+            .matches("packaging/config/letsnote-wheelpad.toml")
+            .count(),
+        2
+    );
     assert!(!cargo_toml.contains("packaging/udev/72-letsnote-wheelpad-system.rules"));
-    assert!(!cargo_toml.contains("packaging/systemd/letsnote-wheelpad@.service"));
 
     assert_eq!(
         cargo_toml
@@ -198,5 +266,26 @@ fn new_system_assets_are_not_yet_packaged() {
             .count(),
         2,
         "Debian and RPM must still package the current user service"
+    );
+
+    for forbidden in [
+        "system-service-enabled",
+        "migration-staging",
+        "migrate-system-service",
+        "letsnote-wheelpad-migrate",
+        "setfacl",
+    ] {
+        assert!(
+            !cargo_toml.contains(forbidden),
+            "package metadata introduced migration or activation token: {forbidden}"
+        );
+    }
+
+    assert_eq!(cargo_toml.matches("udevadm trigger || true").count(), 1);
+    assert_eq!(
+        cargo_toml
+            .matches("systemctl daemon-reload || true")
+            .count(),
+        1
     );
 }
