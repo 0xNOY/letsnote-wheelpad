@@ -150,17 +150,19 @@ running_daemons()
     daemon_pids=
     for process_exe in /proc/[0-9]*/exe
     do
-        [ -e "$process_exe" ] || continue
+        [ -L "$process_exe" ] || continue
         resolved=$(readlink "$process_exe" 2>/dev/null || true)
-        if [ "$resolved" = "$daemon" ]; then
-            process_pid=${process_exe#/proc/}
-            process_pid=${process_pid%/exe}
-            if [ -n "$daemon_pids" ]; then
-                daemon_pids="$daemon_pids $process_pid"
-            else
-                daemon_pids=$process_pid
-            fi
-        fi
+        case "$resolved" in
+            "$daemon"|"$daemon (deleted)")
+                process_pid=${process_exe#/proc/}
+                process_pid=${process_pid%/exe}
+                if [ -n "$daemon_pids" ]; then
+                    daemon_pids="$daemon_pids $process_pid"
+                else
+                    daemon_pids=$process_pid
+                fi
+                ;;
+        esac
     done
     [ -z "$daemon_pids" ]
 }
@@ -179,7 +181,8 @@ print_node_state()
 named_acl_entries()
 {
     acl_node=$1
-    getfacl -cp "$acl_node" 2>/dev/null |
+    acl_output=$(getfacl -cp "$acl_node" 2>/dev/null) || return 1
+    printf '%s\n' "$acl_output" |
         awk -F: '$1 == "user" && $2 != "" { print }'
 }
 
@@ -194,7 +197,10 @@ print_acl_state()
         printf '%s named user ACLs: node absent\n' "$acl_node"
         return
     fi
-    acl_entries=$(named_acl_entries "$acl_node")
+    if ! acl_entries=$(named_acl_entries "$acl_node"); then
+        printf '%s named user ACLs: unknown (getfacl failed)\n' "$acl_node"
+        return
+    fi
     if [ -n "$acl_entries" ]; then
         printf '%s named user ACLs: present\n' "$acl_node"
         printf '%s\n' "$acl_entries" | while IFS= read -r acl_entry
@@ -309,7 +315,9 @@ verify_no_named_acls()
     command -v getfacl >/dev/null 2>&1 || fail "getfacl is required; staging will be rolled back"
     for acl_node in "$selected_path" /dev/uinput
     do
-        acl_entries=$(named_acl_entries "$acl_node")
+        if ! acl_entries=$(named_acl_entries "$acl_node"); then
+            fail "getfacl failed for $acl_node; staging will be rolled back"
+        fi
         if [ -n "$acl_entries" ]; then
             printf '%s: named user ACL remains on %s:\n' "$program" "$acl_node" >&2
             printf '%s\n' "$acl_entries" >&2
@@ -320,6 +328,8 @@ verify_no_named_acls()
 
 cleanup_mode=
 staging_started=0
+staging_created=0
+user_block_created=0
 instance_started=0
 marker_created=0
 marker_tmp=
@@ -345,7 +355,12 @@ cleanup_failure()
         if [ -n "$marker_tmp" ]; then
             rm -f "$marker_tmp"
         fi
-        rm -f "$staging_marker" "$user_block_marker"
+        if [ "$staging_created" -eq 1 ]; then
+            rm -f "$staging_marker"
+        fi
+        if [ "$user_block_created" -eq 1 ]; then
+            rm -f "$user_block_marker"
+        fi
         udevadm control --reload-rules
         if recheck_selected_device; then
             udevadm trigger --action=change --subsystem-match=input --sysname-match="$selected_event"
@@ -354,7 +369,7 @@ cleanup_failure()
             udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput
         fi
         udevadm settle
-    elif [ -n "$cleanup_mode" ]; then
+    elif [ "$cleanup_mode" = enable ] && [ "$user_block_created" -eq 1 ]; then
         rm -f "$user_block_marker"
     fi
     exit "$cleanup_status"
@@ -362,41 +377,55 @@ cleanup_failure()
 
 enable_system_service()
 {
-    cleanup_mode=enable
-    trap cleanup_failure EXIT
-    trap 'exit 1' HUP INT TERM
     acquire_lock
     select_device "$1"
     verify_config
     verify_identity
 
-    if [ -e "$persistent_marker" ]; then
-        if systemctl is-active --quiet "$selected_unit"; then
+    persistent_present=0
+    staging_present=0
+    user_block_present=0
+    system_active=0
+    [ ! -e "$persistent_marker" ] || persistent_present=1
+    [ ! -e "$staging_marker" ] || staging_present=1
+    [ ! -e "$user_block_marker" ] || user_block_present=1
+    if systemctl is-active --quiet "$selected_unit"; then
+        system_active=1
+    fi
+
+    if [ "$persistent_present" -eq 1 ]; then
+        if [ "$system_active" -eq 1 ]; then
             printf 'already enabled: %s is active\n' "$selected_unit"
-            cleanup_mode=
-            trap - EXIT HUP INT TERM
             return
         fi
         fail "persistent marker exists but $selected_unit is not active"
     fi
-    if systemctl is-active --quiet "$selected_unit"; then
-        fail "$selected_unit is active without the persistent marker"
+    if [ "$staging_present" -eq 1 ] ||
+        [ "$user_block_present" -eq 1 ] ||
+        [ "$system_active" -eq 1 ]
+    then
+        fail "interrupted migration state detected; recover with: letsnote-wheelpad-migrate disable --device $selected_path"
     fi
 
+    cleanup_mode=enable
+    trap cleanup_failure EXIT
+    trap 'exit 1' HUP INT TERM
+    user_block_created=1
     : >"$user_block_marker"
     if ! running_daemons; then
         printf '%s: running %s process(es): %s\n' "$program" "$daemon" "$daemon_pids" >&2
         fail "first run: systemctl --user disable --now letsnote-wheelpad.service"
     fi
 
-    instance_started=1
     staging_started=1
+    staging_created=1
     : >"$staging_marker"
     reload_and_trigger
     verify_node_access "$selected_path"
     verify_node_access /dev/uinput
     verify_no_named_acls
 
+    instance_started=1
     systemctl start "$selected_unit"
     systemctl is-active --quiet "$selected_unit" || fail "$selected_unit did not become active"
     main_pid=$(systemctl show --property=MainPID --value "$selected_unit")
@@ -425,7 +454,7 @@ disable_system_service()
     trap 'exit 1' HUP INT TERM
     acquire_lock
     select_device "$1"
-    : >"$user_block_marker"
+    [ -e "$user_block_marker" ] || : >"$user_block_marker"
     systemctl stop "$selected_unit"
     stopped_state=$(systemctl show --property=ActiveState --value "$selected_unit")
     stopped_pid=$(systemctl show --property=MainPID --value "$selected_unit")

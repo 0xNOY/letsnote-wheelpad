@@ -437,3 +437,103 @@ fn migration_helper_has_narrow_mutation_surface() {
     assert!(explicit_start < ready_pid_check);
     assert!(ready_pid_check < marker_creation);
 }
+
+#[test]
+fn migration_helper_matches_only_package_daemon_executables() {
+    let helper = repository_file("packaging/migrate/letsnote-wheelpad-migrate");
+    let running_daemons = helper
+        .split_once("running_daemons()\n{")
+        .expect("missing running_daemons")
+        .1
+        .split_once("\n}\n\nprint_node_state()")
+        .expect("unterminated running_daemons")
+        .0;
+
+    assert!(running_daemons.contains(r#"[ -L "$process_exe" ] || continue"#));
+    assert!(running_daemons.contains(r#""$daemon"|"$daemon (deleted)")"#));
+    assert_eq!(running_daemons.matches(r#""$daemon""#).count(), 1);
+    assert_eq!(running_daemons.matches(r#""$daemon (deleted)""#).count(), 1);
+    assert!(!running_daemons.contains("${resolved##*/}"));
+    assert!(!running_daemons.contains("cmdline"));
+    assert!(!running_daemons.contains(r#""*/letsnote-wheelpad"#));
+}
+
+#[test]
+fn migration_helper_treats_getfacl_failure_as_unknown_or_fatal() {
+    let helper = repository_file("packaging/migrate/letsnote-wheelpad-migrate");
+    let named_acl_entries = helper
+        .split_once("named_acl_entries()\n{")
+        .expect("missing named_acl_entries")
+        .1
+        .split_once("\n}\n\nprint_acl_state()")
+        .expect("unterminated named_acl_entries")
+        .0;
+
+    let capture = named_acl_entries
+        .find(r#"acl_output=$(getfacl -cp "$acl_node" 2>/dev/null) || return 1"#)
+        .expect("getfacl failure must be preserved");
+    let extraction = named_acl_entries
+        .find(r#"printf '%s\n' "$acl_output" |"#)
+        .expect("ACL extraction must use captured output");
+    assert!(capture < extraction);
+    assert!(!named_acl_entries.contains(r#"getfacl -cp "$acl_node" 2>/dev/null |"#));
+    assert_eq!(
+        helper
+            .matches(r#"if ! acl_entries=$(named_acl_entries "$acl_node"); then"#)
+            .count(),
+        2
+    );
+    assert!(helper.contains("named user ACLs: unknown (getfacl failed)"));
+    assert!(helper.contains("getfacl failed for $acl_node; staging will be rolled back"));
+}
+
+#[test]
+fn migration_helper_preserves_preexisting_interruption_state() {
+    let helper = repository_file("packaging/migrate/letsnote-wheelpad-migrate");
+    let cleanup_failure = helper
+        .split_once("cleanup_failure()\n{")
+        .expect("missing cleanup_failure")
+        .1
+        .split_once("\n}\n\nenable_system_service()")
+        .expect("unterminated cleanup_failure")
+        .0;
+    let enable = helper
+        .split_once("enable_system_service()\n{")
+        .expect("missing enable_system_service")
+        .1
+        .split_once("\n}\n\ndisable_system_service()")
+        .expect("unterminated enable_system_service")
+        .0;
+
+    let lock = enable.find("    acquire_lock").unwrap();
+    let device = enable.find(r#"    select_device "$1""#).unwrap();
+    let config = enable.find("    verify_config").unwrap();
+    let identity = enable.find("    verify_identity").unwrap();
+    let persistent = enable.find("    persistent_present=0").unwrap();
+    let staging = enable.find("    staging_present=0").unwrap();
+    let user_block = enable.find("    user_block_present=0").unwrap();
+    let active = enable.find("    system_active=0").unwrap();
+    let inconsistent = enable
+        .find("interrupted migration state detected; recover with: letsnote-wheelpad-migrate disable --device $selected_path")
+        .unwrap();
+    let cleanup = enable.find("    cleanup_mode=enable").unwrap();
+    assert!(lock < device);
+    assert!(device < config);
+    assert!(config < identity);
+    assert!(identity < persistent);
+    assert!(persistent < staging);
+    assert!(staging < user_block);
+    assert!(user_block < active);
+    assert!(active < inconsistent);
+    assert!(inconsistent < cleanup);
+
+    assert!(helper.contains(
+        "if [ \"$user_block_created\" -eq 1 ]; then\n            rm -f \"$user_block_marker\""
+    ));
+    assert!(helper.contains(
+        "if [ \"$staging_created\" -eq 1 ]; then\n            rm -f \"$staging_marker\""
+    ));
+    assert!(!cleanup_failure.contains(r#"rm -f "$staging_marker" "$user_block_marker""#));
+    assert!(!cleanup_failure.contains(r#"elif [ -n "$cleanup_mode" ]; then"#));
+    assert!(helper.contains(r#"[ -e "$user_block_marker" ] || : >"$user_block_marker""#));
+}
