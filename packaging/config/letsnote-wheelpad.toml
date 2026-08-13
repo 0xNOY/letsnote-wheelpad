@@ -1,0 +1,18 @@
+# Omit `device` to select the physical touchpad by name.
+device_name_regex = "Synaptics.*TM3562"
+
+[scroll]
+enable = true
+reverse_vertical = false
+horizontal_enable = false
+reverse_horizontal = false
+sensitivity = 0
+detect_area_width = 0
+detect_area_radius = 200.0
+coordinate_y_scale = 1.0
+minimum_rotation_radius = 250.0
+horizontal_start = 2
+horizontal_end = 6
+
+[log]
+level = "info"
