@@ -49,6 +49,29 @@ systemctl --user daemon-reload
 systemctl --user enable --now letsnote-wheelpad.service
 ```
 
+## Explicit system-service migration (0.2.0 preview)
+
+Migration is an administrator-initiated opt-in for a machine with exactly one supported physical touchpad. Package installation or upgrade alone does not migrate the service. Stop the legacy user daemon, use the event path reported by `status`, and enable system mode:
+
+```sh
+systemctl --user disable --now letsnote-wheelpad.service
+sudo /usr/libexec/letsnote-wheelpad-migrate status
+sudo /usr/libexec/letsnote-wheelpad-migrate enable \
+  --device /dev/input/eventN
+```
+
+Never copy `eventN` from an old log; input event numbers can change. Migration does not copy user configuration or delete ACLs. It refuses to proceed while any daemon is running or while a named user ACL remains.
+
+To return to the legacy user service:
+
+```sh
+sudo /usr/libexec/letsnote-wheelpad-migrate disable \
+  --device /dev/input/eventN
+systemctl --user enable --now letsnote-wheelpad.service
+```
+
+Remove, purge, and downgrade handling remain pending, so 0.2.0 is not yet a production release.
+
 ## Configuration
 
 Configuration lives in `~/.config/letsnote-wheelpad/config.toml`. All keys are optional; defaults match the Windows out-of-box behaviour.

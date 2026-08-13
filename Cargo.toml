@@ -52,6 +52,8 @@ maintainer-scripts = "packaging/deb"
 assets = [
     ["target/release/letsnote-wheelpad", "usr/bin/", "755"],
     ["packaging/udev/70-letsnote-wheelpad.rules", "usr/lib/udev/rules.d/", "644"],
+    ["packaging/udev/72-letsnote-wheelpad-system.rules", "usr/lib/udev/rules.d/", "644"],
+    ["packaging/migrate/letsnote-wheelpad-migrate", "usr/libexec/", "755"],
     ["packaging/systemd/letsnote-wheelpad.service", "usr/lib/systemd/user/", "644"],
     ["packaging/systemd/letsnote-wheelpad@.service", "usr/lib/systemd/system/", "644"],
     ["packaging/sysusers/letsnote-wheelpad.conf", "usr/lib/sysusers.d/", "644"],
@@ -71,6 +73,8 @@ summary = "Let's Note WheelPad circular touchpad scroll daemon"
 assets = [
     { source = "target/release/letsnote-wheelpad", dest = "/usr/bin/letsnote-wheelpad", mode = "755" },
     { source = "packaging/udev/70-letsnote-wheelpad.rules", dest = "/usr/lib/udev/rules.d/70-letsnote-wheelpad.rules", mode = "644" },
+    { source = "packaging/udev/72-letsnote-wheelpad-system.rules", dest = "/usr/lib/udev/rules.d/72-letsnote-wheelpad-system.rules", mode = "644" },
+    { source = "packaging/migrate/letsnote-wheelpad-migrate", dest = "/usr/libexec/letsnote-wheelpad-migrate", mode = "755" },
     { source = "packaging/systemd/letsnote-wheelpad.service", dest = "/usr/lib/systemd/user/letsnote-wheelpad.service", mode = "644" },
     { source = "packaging/systemd/letsnote-wheelpad@.service", dest = "/usr/lib/systemd/system/letsnote-wheelpad@.service", mode = "644" },
     { source = "packaging/sysusers/letsnote-wheelpad.conf", dest = "/usr/lib/sysusers.d/letsnote-wheelpad.conf", mode = "644" },
@@ -81,9 +85,39 @@ assets = [
     { source = "LICENSE", dest = "/usr/share/doc/letsnote-wheelpad/LICENSE", mode = "644", doc = true },
 ]
 post_install_script = """
-udevadm control --reload-rules || true
-udevadm trigger || true
-systemctl daemon-reload || true
+identity_ready=0
+device_mutation_ready=0
+if command -v getent >/dev/null 2>&1; then
+    if getent passwd letsnote-wheelpad >/dev/null 2>&1 && getent group letsnote-wheelpad >/dev/null 2>&1; then
+        identity_ready=1
+    elif command -v systemd-sysusers >/dev/null 2>&1; then
+        if ! systemd-sysusers /usr/lib/sysusers.d/letsnote-wheelpad.conf; then
+            echo "letsnote-wheelpad: systemd-sysusers failed" >&2
+            exit 1
+        fi
+        if getent passwd letsnote-wheelpad >/dev/null 2>&1 && getent group letsnote-wheelpad >/dev/null 2>&1; then
+            identity_ready=1
+        else
+            echo "letsnote-wheelpad: dedicated passwd/group identity was not created" >&2
+            exit 1
+        fi
+    else
+        echo "letsnote-wheelpad: systemd-sysusers unavailable; skipping system/device mutation" >&2
+    fi
+else
+    echo "letsnote-wheelpad: getent unavailable; skipping system/device mutation" >&2
+fi
+
+if [ "$identity_ready" -eq 1 ] && command -v udevadm >/dev/null 2>&1; then
+    device_mutation_ready=1
+    udevadm control --reload-rules || true
+    udevadm trigger || true
+elif [ "$identity_ready" -eq 1 ]; then
+    echo "letsnote-wheelpad: udevadm unavailable; skipping device mutation" >&2
+fi
+if [ "$device_mutation_ready" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+fi
 """
 pre_uninstall_script = """
 true

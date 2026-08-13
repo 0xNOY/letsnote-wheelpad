@@ -1,21 +1,47 @@
 #!/bin/sh
 set -e
 
-# Reload udev so the rule takes effect for currently plugged-in devices.
-if command -v udevadm >/dev/null 2>&1; then
+identity_ready=0
+device_mutation_ready=0
+if command -v getent >/dev/null 2>&1; then
+    if getent passwd letsnote-wheelpad >/dev/null 2>&1 && getent group letsnote-wheelpad >/dev/null 2>&1; then
+        identity_ready=1
+    elif command -v systemd-sysusers >/dev/null 2>&1; then
+        if ! systemd-sysusers /usr/lib/sysusers.d/letsnote-wheelpad.conf; then
+            echo "letsnote-wheelpad: systemd-sysusers failed" >&2
+            exit 1
+        fi
+        if getent passwd letsnote-wheelpad >/dev/null 2>&1 && getent group letsnote-wheelpad >/dev/null 2>&1; then
+            identity_ready=1
+        else
+            echo "letsnote-wheelpad: dedicated passwd/group identity was not created" >&2
+            exit 1
+        fi
+    else
+        echo "letsnote-wheelpad: systemd-sysusers unavailable; skipping system/device mutation" >&2
+    fi
+else
+    echo "letsnote-wheelpad: getent unavailable; skipping system/device mutation" >&2
+fi
+
+# Reload udev only after the rule's dedicated group has been verified.
+if [ "$identity_ready" -eq 1 ] && command -v udevadm >/dev/null 2>&1; then
+    device_mutation_ready=1
     udevadm control --reload-rules || true
     udevadm trigger || true
+elif [ "$identity_ready" -eq 1 ]; then
+    echo "letsnote-wheelpad: udevadm unavailable; skipping device mutation" >&2
 fi
 
 # Make sure the uinput module is loaded now (modules-load.d only acts at
 # boot).
-if [ -e /proc/modules ] && ! grep -q '^uinput ' /proc/modules; then
+if [ "$device_mutation_ready" -eq 1 ] && [ -e /proc/modules ] && ! grep -q '^uinput ' /proc/modules; then
     modprobe uinput || true
 fi
 
 # Enable the user service for all users at next login. (Per-user
 # enabling: `systemctl --user enable --now letsnote-wheelpad`.)
-if command -v systemctl >/dev/null 2>&1; then
+if [ "$device_mutation_ready" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
     systemctl --global enable letsnote-wheelpad.service || true
 fi
 

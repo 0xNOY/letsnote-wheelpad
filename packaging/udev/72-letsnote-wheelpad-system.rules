@@ -1,3 +1,11 @@
+# This rule is inert until an administrator opts in persistently or the
+# migration helper opens its temporary staging window.
+TEST=="/run/letsnote-wheelpad/migration-staging", GOTO="letsnote_wheelpad_system_authorized"
+TEST=="/etc/letsnote-wheelpad/system-service-enabled", GOTO="letsnote_wheelpad_system_authorized"
+GOTO="letsnote_wheelpad_system_end"
+
+LABEL="letsnote_wheelpad_system_authorized"
+
 # Dedicated access to the global uinput control node.
 ACTION=="add|change", SUBSYSTEM=="misc", KERNEL=="uinput", \
     MODE="0660", GROUP="letsnote-wheelpad", TAG-="uaccess", \
@@ -33,3 +41,5 @@ ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", \
 # Removing the uaccess tag prevents subsequent packaged uaccess ACL grants.
 # One-time cleanup of named ACLs left by an earlier package belongs to package
 # migration; do not run an external ACL helper for each device event.
+
+LABEL="letsnote_wheelpad_system_end"
