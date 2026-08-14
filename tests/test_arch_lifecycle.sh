@@ -5,9 +5,38 @@ package_path=$1
 repository_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 marker_dir=/run/letsnote-wheelpad
 marker=$marker_dir/migration-staging
+test_dir=$(mktemp -d)
+trap 'rm -r "$test_dir"' EXIT HUP INT TERM
 
 grep -q 'Direct RPM or Arch downgrade without this preparation is unsupported' \
     "$repository_root/README.md"
+
+bsdtar -xOf "$package_path" .INSTALL >"$test_dir/letsnote-wheelpad-bin.install"
+mkdir "$test_dir/bin"
+printf '%s\n' '#!/bin/sh' 'exit 1' >"$test_dir/bin/getent"
+printf '%s\n' '#!/bin/sh' 'exit 1' >"$test_dir/bin/systemd-sysusers"
+chmod 0755 "$test_dir/bin/getent" "$test_dir/bin/systemd-sysusers"
+if failure_output=$(
+    PATH="$test_dir/bin:/usr/bin:/bin"
+    export PATH
+    . "$test_dir/letsnote-wheelpad-bin.install"
+    post_install 0.2.0-1 2>&1
+); then
+    echo 'Arch post_install unexpectedly ignored systemd-sysusers failure' >&2
+    exit 1
+else
+    failure_status=$?
+fi
+[ "$failure_status" -ne 0 ]
+printf '%s\n' "$failure_output" |
+    grep -q 'letsnote-wheelpad: systemd-sysusers failed'
+if printf '%s\n' "$failure_output" |
+    grep -Eq 'package installation does not enable a service|Legacy mode:|System mode:'; then
+    echo 'Arch post_install printed success instructions after failure' >&2
+    exit 1
+fi
+printf 'verified Arch post_install failure propagation (status %s)\n' \
+    "$failure_status"
 
 pacman -U --noconfirm "$package_path"
 pacman -Q letsnote-wheelpad-bin >/dev/null

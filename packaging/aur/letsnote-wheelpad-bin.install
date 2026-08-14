@@ -1,5 +1,5 @@
 post_install() {
-    post_upgrade
+    post_upgrade "$@" || return $?
     printf '%s\n' \
         'letsnote-wheelpad: package installation does not enable a service.' \
         'Legacy mode: systemctl --user enable --now letsnote-wheelpad.service' \
