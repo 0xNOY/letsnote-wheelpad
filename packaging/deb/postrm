@@ -1,24 +1,18 @@
-post_install() {
-    post_upgrade
-    echo 'Run systemctl --user enable --now letsnote-wheelpad.service to enable legacy mode.'
-}
+#!/bin/sh
+set -e
 
-post_upgrade() {
-    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-        systemctl daemon-reload ||
-            echo 'letsnote-wheelpad: system manager daemon-reload failed' >&2
-    else
-        echo 'letsnote-wheelpad: systemd runtime unavailable; skipping device refresh' >&2
+targeted_udev_refresh()
+{
+    if ! command -v systemctl >/dev/null 2>&1 ||
+        ! command -v udevadm >/dev/null 2>&1 ||
+        [ ! -d /run/systemd/system ] || [ ! -d /sys/class/input ] ||
+        [ ! -e /run/udev/control ]; then
+        echo "letsnote-wheelpad: udev runtime unavailable; skipping device refresh" >&2
         return 0
     fi
 
-    if ! command -v udevadm >/dev/null 2>&1 ||
-        [ ! -d /sys/class/input ] || [ ! -e /run/udev/control ]; then
-        echo 'letsnote-wheelpad: udev runtime unavailable; skipping device refresh' >&2
-        return 0
-    fi
     if ! udevadm control --reload-rules; then
-        echo 'letsnote-wheelpad: could not reload udev rules; skipping device refresh' >&2
+        echo "letsnote-wheelpad: could not reload udev rules; skipping device refresh" >&2
         return 0
     fi
 
@@ -31,6 +25,7 @@ post_upgrade() {
         bustype=$(cat "$event_path/device/id/bustype" 2>/dev/null) || continue
         vendor=$(cat "$event_path/device/id/vendor" 2>/dev/null) || continue
         product=$(cat "$event_path/device/id/product" 2>/dev/null) || continue
+
         [ "$bustype" != 0006 ] || continue
         case "$bustype:$vendor:$product" in
             0006:6c6e:7470|0006:6c6e:7770) continue ;;
@@ -48,14 +43,25 @@ post_upgrade() {
             --sysname-match="$event_sysname" ||
             echo "letsnote-wheelpad: targeted refresh failed for $event_sysname" >&2
     done
+
     if [ -e /sys/class/misc/uinput ]; then
         udevadm trigger --action=change --subsystem-match=misc \
             --sysname-match=uinput ||
-            echo 'letsnote-wheelpad: targeted refresh failed for uinput' >&2
+            echo "letsnote-wheelpad: targeted refresh failed for uinput" >&2
     fi
-    udevadm settle || echo 'letsnote-wheelpad: udev settlement failed' >&2
+    udevadm settle || echo "letsnote-wheelpad: udev settlement failed" >&2
 }
 
-post_remove() {
-    post_upgrade
-}
+case "${1:-}" in
+    remove)
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl daemon-reload ||
+                echo "letsnote-wheelpad: system manager daemon-reload failed" >&2
+        else
+            echo "letsnote-wheelpad: systemd runtime unavailable; skipping daemon-reload" >&2
+        fi
+        targeted_udev_refresh
+        ;;
+esac
+
+exit 0

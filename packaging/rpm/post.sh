@@ -1,17 +1,88 @@
 #!/bin/sh
 set -e
 
-if command -v udevadm >/dev/null 2>&1; then
-    udevadm control --reload-rules || true
-    udevadm trigger || true
+targeted_udev_refresh()
+{
+    if ! command -v systemctl >/dev/null 2>&1 ||
+        ! command -v udevadm >/dev/null 2>&1 ||
+        [ ! -d /run/systemd/system ] || [ ! -d /sys/class/input ] ||
+        [ ! -e /run/udev/control ]; then
+        echo "letsnote-wheelpad: udev runtime unavailable; skipping device refresh" >&2
+        return 0
+    fi
+    if ! udevadm control --reload-rules; then
+        echo "letsnote-wheelpad: could not reload udev rules; skipping device refresh" >&2
+        return 0
+    fi
+
+    for event_path in /sys/class/input/event*; do
+        [ -e "$event_path" ] || continue
+        event_sysname=${event_path##*/}
+        properties=$(udevadm info --query=property --path="$event_path" 2>/dev/null) || continue
+        printf '%s\n' "$properties" | grep -qx 'ID_INPUT_TOUCHPAD=1' || continue
+        name=$(cat "$event_path/device/name" 2>/dev/null) || continue
+        bustype=$(cat "$event_path/device/id/bustype" 2>/dev/null) || continue
+        vendor=$(cat "$event_path/device/id/vendor" 2>/dev/null) || continue
+        product=$(cat "$event_path/device/id/product" 2>/dev/null) || continue
+
+        [ "$bustype" != 0006 ] || continue
+        case "$bustype:$vendor:$product" in
+            0006:6c6e:7470|0006:6c6e:7770) continue ;;
+        esac
+        supported=0
+        case "$name" in
+            *TM3562*) supported=1 ;;
+        esac
+        if [ "$name" = 'SynPS/2 Synaptics TouchPad' ] &&
+            [ "$bustype:$vendor:$product" = '0011:0002:0007' ]; then
+            supported=1
+        fi
+        [ "$supported" -eq 1 ] || continue
+        udevadm trigger --action=change --subsystem-match=input \
+            --sysname-match="$event_sysname" ||
+            echo "letsnote-wheelpad: targeted refresh failed for $event_sysname" >&2
+    done
+
+    if [ -e /sys/class/misc/uinput ]; then
+        udevadm trigger --action=change --subsystem-match=misc \
+            --sysname-match=uinput ||
+            echo "letsnote-wheelpad: targeted refresh failed for uinput" >&2
+    fi
+    udevadm settle || echo "letsnote-wheelpad: udev settlement failed" >&2
+}
+
+identity_ready=0
+if command -v getent >/dev/null 2>&1; then
+    if getent passwd letsnote-wheelpad >/dev/null 2>&1 &&
+        getent group letsnote-wheelpad >/dev/null 2>&1; then
+        identity_ready=1
+    elif command -v systemd-sysusers >/dev/null 2>&1; then
+        if ! systemd-sysusers /usr/lib/sysusers.d/letsnote-wheelpad.conf; then
+            echo "letsnote-wheelpad: systemd-sysusers failed" >&2
+            exit 1
+        fi
+        if getent passwd letsnote-wheelpad >/dev/null 2>&1 &&
+            getent group letsnote-wheelpad >/dev/null 2>&1; then
+            identity_ready=1
+        else
+            echo "letsnote-wheelpad: dedicated passwd/group identity was not created" >&2
+            exit 1
+        fi
+    else
+        echo "letsnote-wheelpad: systemd-sysusers unavailable; skipping system/device mutation" >&2
+    fi
+else
+    echo "letsnote-wheelpad: getent unavailable; skipping system/device mutation" >&2
 fi
 
-if [ -e /proc/modules ] && ! grep -q '^uinput ' /proc/modules; then
-    modprobe uinput || true
-fi
-
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl --global enable letsnote-wheelpad.service || true
+if [ "$identity_ready" -eq 1 ]; then
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload ||
+            echo "letsnote-wheelpad: system manager daemon-reload failed" >&2
+    else
+        echo "letsnote-wheelpad: systemd runtime unavailable; skipping daemon-reload" >&2
+    fi
+    targeted_udev_refresh
 fi
 
 exit 0

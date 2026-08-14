@@ -68,13 +68,18 @@ def verify_deb(path: Path) -> None:
     metadata = control["/control"][0].decode()
     version = next(line for line in metadata.splitlines() if line.startswith("Version: "))
     assert version.split(maxsplit=1)[1].split("-", 1)[0] == "0.2.0", version
+    dependencies = next(
+        line for line in metadata.splitlines() if line.startswith("Depends: ")
+    )
+    dependency_names = {item.strip().split()[0] for item in dependencies[9:].split(",")}
+    assert "acl" in dependency_names
     require_payload(set(payload))
 
     conffiles = control["/conffiles"][0].decode().splitlines()
     assert "/etc/letsnote-wheelpad/config.toml" in conffiles, conffiles
 
     root = Path(__file__).resolve().parent.parent
-    for name in ("postinst", "prerm"):
+    for name in ("postinst", "prerm", "postrm"):
         packaged = control[f"/{name}"][0].decode().strip()
         repository = (root / "packaging" / "deb" / name).read_text().strip()
         assert packaged == repository, f"Debian {name} changed in the artifact"
@@ -165,14 +170,20 @@ def verify_rpm(path: Path) -> None:
     assert modes[files.index(helper_path)] & 0o7777 == 0o755
 
     root = Path(__file__).resolve().parent.parent
-    cargo_toml = (root / "Cargo.toml").read_text()
-    expected_post = cargo_toml.split('post_install_script = """', 1)[1].split(
-        '"""', 1
-    )[0]
-    assert str(header[1024]).strip() == expected_post.strip(), "RPM %post changed"
-    assert str(header[1025]).strip() == "true", "RPM %preun changed"
+    assert str(header[1024]).strip() == (
+        root / "packaging/rpm/post.sh"
+    ).read_text().strip(), "RPM %post changed"
+    assert str(header[1025]).strip() == (
+        root / "packaging/rpm/preun.sh"
+    ).read_text().strip(), "RPM %preun changed"
+    assert str(header[1026]).strip() == (
+        root / "packaging/rpm/postun.sh"
+    ).read_text().strip(), "RPM %postun changed"
     assert 1023 not in header, "unexpected RPM %pre"
-    assert 1026 not in header, "unexpected RPM %postun"
+
+    requires = header[1049]
+    assert isinstance(requires, list)
+    assert {"acl", "systemd", "systemd-udev"} <= set(requires)
 
     for required in (
         "/usr/lib/udev/rules.d/70-letsnote-wheelpad.rules",
