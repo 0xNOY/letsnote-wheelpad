@@ -1,6 +1,6 @@
 [package]
 name = "letsnote-wheelpad"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Userland daemon that ports Panasonic Let's Note WheelPad (circular touchpad scroll) to Linux"
@@ -47,12 +47,17 @@ physical Synaptics touchpad and emitting wheel events via a uinput virtual
 device. Works on Wayland and X11."""
 section = "utils"
 priority = "optional"
-depends = "$auto, systemd, udev"
+depends = "$auto, acl, systemd, udev"
 maintainer-scripts = "packaging/deb"
 assets = [
     ["target/release/letsnote-wheelpad", "usr/bin/", "755"],
     ["packaging/udev/70-letsnote-wheelpad.rules", "usr/lib/udev/rules.d/", "644"],
+    ["packaging/udev/72-letsnote-wheelpad-system.rules", "usr/lib/udev/rules.d/", "644"],
+    ["packaging/migrate/letsnote-wheelpad-migrate", "usr/libexec/", "755"],
     ["packaging/systemd/letsnote-wheelpad.service", "usr/lib/systemd/user/", "644"],
+    ["packaging/systemd/letsnote-wheelpad@.service", "usr/lib/systemd/system/", "644"],
+    ["packaging/sysusers/letsnote-wheelpad.conf", "usr/lib/sysusers.d/", "644"],
+    ["packaging/config/letsnote-wheelpad.toml", "etc/letsnote-wheelpad/config.toml", "644"],
     ["packaging/modules-load/letsnote-wheelpad.conf", "usr/lib/modules-load.d/", "644"],
     ["README.md", "usr/share/doc/letsnote-wheelpad/README.md", "644"],
     ["README.ja.md", "usr/share/doc/letsnote-wheelpad/README.ja.md", "644"],
@@ -68,17 +73,22 @@ summary = "Let's Note WheelPad circular touchpad scroll daemon"
 assets = [
     { source = "target/release/letsnote-wheelpad", dest = "/usr/bin/letsnote-wheelpad", mode = "755" },
     { source = "packaging/udev/70-letsnote-wheelpad.rules", dest = "/usr/lib/udev/rules.d/70-letsnote-wheelpad.rules", mode = "644" },
+    { source = "packaging/udev/72-letsnote-wheelpad-system.rules", dest = "/usr/lib/udev/rules.d/72-letsnote-wheelpad-system.rules", mode = "644" },
+    { source = "packaging/migrate/letsnote-wheelpad-migrate", dest = "/usr/libexec/letsnote-wheelpad-migrate", mode = "755" },
     { source = "packaging/systemd/letsnote-wheelpad.service", dest = "/usr/lib/systemd/user/letsnote-wheelpad.service", mode = "644" },
+    { source = "packaging/systemd/letsnote-wheelpad@.service", dest = "/usr/lib/systemd/system/letsnote-wheelpad@.service", mode = "644" },
+    { source = "packaging/sysusers/letsnote-wheelpad.conf", dest = "/usr/lib/sysusers.d/letsnote-wheelpad.conf", mode = "644" },
+    { source = "packaging/config/letsnote-wheelpad.toml", dest = "/etc/letsnote-wheelpad/config.toml", mode = "644", config = "noreplace" },
     { source = "packaging/modules-load/letsnote-wheelpad.conf", dest = "/usr/lib/modules-load.d/letsnote-wheelpad.conf", mode = "644" },
     { source = "README.md", dest = "/usr/share/doc/letsnote-wheelpad/README.md", mode = "644", doc = true },
     { source = "README.ja.md", dest = "/usr/share/doc/letsnote-wheelpad/README.ja.md", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/doc/letsnote-wheelpad/LICENSE", mode = "644", doc = true },
 ]
-post_install_script = """
-udevadm control --reload-rules || true
-udevadm trigger || true
-systemctl daemon-reload || true
-"""
-pre_uninstall_script = """
-true
-"""
+post_install_script = "packaging/rpm/post.sh"
+pre_uninstall_script = "packaging/rpm/preun.sh"
+post_uninstall_script = "packaging/rpm/postun.sh"
+
+[package.metadata.generate-rpm.requires]
+acl = "*"
+systemd = "*"
+systemd-udev = "*"

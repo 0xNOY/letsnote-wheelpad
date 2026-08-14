@@ -3,6 +3,8 @@ Description=Let's Note WheelPad (circular touchpad scroll)
 Documentation=https://github.com/Nerahikada/letsnote-wheelpad
 After=graphical-session.target
 PartOf=graphical-session.target
+ConditionPathExists=!/etc/letsnote-wheelpad/system-service-enabled
+ConditionPathExists=!/run/letsnote-wheelpad/migration-block-user-service
 
 [Service]
 Type=notify

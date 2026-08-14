@@ -11,4 +11,7 @@ pub mod detector;
 pub mod error;
 pub mod evdev;
 pub mod fsm;
+pub mod proxy;
+pub mod router;
+pub mod runtime;
 pub mod uinput;

@@ -58,7 +58,16 @@ fn run_gesture_with_transform(
     sensitivity: i32,
     transform: CoordinateTransform,
 ) -> i32 {
-    let mut d = CircularDetector::with_transform(transform);
+    run_gesture_with_geometry(samples, sensitivity, transform, 0.0)
+}
+
+fn run_gesture_with_geometry(
+    samples: &[TouchSample],
+    sensitivity: i32,
+    transform: CoordinateTransform,
+    minimum_rotation_radius: f64,
+) -> i32 {
+    let mut d = CircularDetector::with_geometry(transform, minimum_rotation_radius);
     d.on_gesture_start();
     let mut total = 0_i32;
     for s in samples {
@@ -94,6 +103,18 @@ fn full_counterclockwise_circle_emits_positive_ticks() {
         total > 0,
         "counterclockwise circle should produce positive ticks (got {total})"
     );
+}
+
+#[test]
+fn minimum_rotation_radius_rejects_small_circles() {
+    let small = circle_samples(500, 500, 100.0, 0.0, 2.0 * PI, 24);
+    let large = circle_samples(500, 500, 300.0, 0.0, 2.0 * PI, 24);
+
+    let rejected = run_gesture_with_geometry(&small, 0, IDENTITY, 150.0);
+    let accepted = run_gesture_with_geometry(&large, 0, IDENTITY, 150.0);
+
+    assert_eq!(rejected, 0);
+    assert!(accepted < 0);
 }
 
 #[test]

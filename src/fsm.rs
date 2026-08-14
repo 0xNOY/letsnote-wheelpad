@@ -7,12 +7,26 @@ use crate::detector::{
     CoordinateTransform, TouchSample, TRIGGER_ANGLE,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContactId {
+    pub slot: usize,
+    pub tracking_id: i32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FsmState {
     Idle,
-    Contact { origin: TouchSample },
-    Moving { engage_start: TouchSample },
-    Scrolling,
+    Contact {
+        origin: TouchSample,
+        contact: ContactId,
+    },
+    Moving {
+        engage_start: TouchSample,
+        contact: ContactId,
+    },
+    Scrolling {
+        contact: ContactId,
+    },
     // The FSM has an explicit Debounce state to preserve the structure
     // of the original Windows WheelPad FSM (FUN_1400046a0 case 5).
     //
@@ -34,6 +48,7 @@ pub enum FsmState {
 pub struct TouchFrame {
     pub contact: bool,
     pub pos: Option<TouchSample>,
+    pub contact_id: Option<ContactId>,
 }
 
 /// Side effects the FSM asks the runtime to perform. The runtime also
@@ -72,6 +87,15 @@ impl Fsm {
         self.state
     }
 
+    pub fn contact_id(&self) -> Option<ContactId> {
+        match self.state {
+            FsmState::Contact { contact, .. }
+            | FsmState::Moving { contact, .. }
+            | FsmState::Scrolling { contact } => Some(contact),
+            FsmState::Idle | FsmState::Debounce => None,
+        }
+    }
+
     /// Advance the FSM by one touch frame. Mutates the supplied detector
     /// (which holds the chord-angle accumulator and 20-unit-dead-band
     /// shift register) and the scroll config. Returns the (at most one)
@@ -99,6 +123,9 @@ impl Fsm {
             // ---------- Idle (state 1) ----------
             (FsmState::Idle, false, _) | (FsmState::Idle, true, None) => Action::None,
             (FsmState::Idle, true, Some(s)) => {
+                let Some(contact) = frame.contact_id else {
+                    return Action::None;
+                };
                 // Fresh touch-down: radial-gate classifier (FUN_140005a00).
                 if radial_gate_ok(
                     self.center_x,
@@ -115,10 +142,13 @@ impl Fsm {
                     // are NOT reset here; that happens on the
                     // Moving → Scrolling transition (mirroring
                     // FUN_1400046a0 line 151 which zeros DAT_14003cb00).
-                    self.state = FsmState::Moving { engage_start: s };
+                    self.state = FsmState::Moving {
+                        engage_start: s,
+                        contact,
+                    };
                 } else {
                     // Inside dead zone → CONTACT (trap).
-                    self.state = FsmState::Contact { origin: s };
+                    self.state = FsmState::Contact { origin: s, contact };
                 }
                 Action::None
             }
@@ -143,7 +173,14 @@ impl Fsm {
                 self.state = FsmState::Idle;
                 Action::None
             }
-            (FsmState::Moving { engage_start }, true, Some(s)) => {
+            (
+                FsmState::Moving {
+                    engage_start,
+                    contact,
+                },
+                true,
+                Some(s),
+            ) => {
                 if !radial_gate_ok(
                     self.center_x,
                     self.center_y,
@@ -154,7 +191,7 @@ impl Fsm {
                 ) {
                     // Slipped back into the dead zone — fall back to
                     // Contact (FUN_1400046a0 case 3, lines 127-137).
-                    self.state = FsmState::Contact { origin: s };
+                    self.state = FsmState::Contact { origin: s, contact };
                     Action::None
                 } else {
                     let swept = engagement_swept_angle(
@@ -169,7 +206,7 @@ impl Fsm {
                         // The physical pad is already grabbed (forever);
                         // forwarding suppression is keyed off state.
                         detector.on_gesture_start();
-                        self.state = FsmState::Scrolling;
+                        self.state = FsmState::Scrolling { contact };
                         // Feed the engaging sample so the first tick can
                         // emit on this very frame if the gesture is fast
                         // enough.
@@ -196,14 +233,14 @@ impl Fsm {
             }
 
             // ---------- Scrolling (state 4) ----------
-            (FsmState::Scrolling, false, _) | (FsmState::Scrolling, true, None) => {
+            (FsmState::Scrolling { .. }, false, _) | (FsmState::Scrolling { .. }, true, None) => {
                 // Lift → Debounce. State change alone is enough for the
                 // passthrough runtime to resume forwarding the lift
                 // events to the virtual touchpad.
                 self.state = FsmState::Debounce;
                 Action::None
             }
-            (FsmState::Scrolling, true, Some(s)) => {
+            (FsmState::Scrolling { .. }, true, Some(s)) => {
                 detector.push_if_moved(s);
                 let ticks = detector.step(scroll.sensitivity);
                 if ticks != 0 {
@@ -232,12 +269,10 @@ impl Fsm {
         }
     }
 
-    /// Reset state to Idle and clear the detector's accumulator and
-    /// history. Used by the watchdog when Scrolling has persisted
-    /// without packet progress; restoring Idle resumes touchpad
-    /// passthrough so the cursor isn't frozen indefinitely. We reset
-    /// the detector too so a fresh gesture after the watchdog kick
-    /// doesn't start from a stale half-filled history.
+    /// Explicitly reset state to Idle and clear the detector's
+    /// accumulator and history. The runtime does not call this on a
+    /// timer: a Scrolling session ends only when its tracked contact
+    /// lifts.
     pub fn force_idle(&mut self, detector: &mut CircularDetector) {
         self.state = FsmState::Idle;
         detector.on_gesture_start();
