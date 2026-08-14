@@ -47,7 +47,7 @@ physical Synaptics touchpad and emitting wheel events via a uinput virtual
 device. Works on Wayland and X11."""
 section = "utils"
 priority = "optional"
-depends = "$auto, systemd, udev"
+depends = "$auto, acl, systemd, udev"
 maintainer-scripts = "packaging/deb"
 assets = [
     ["target/release/letsnote-wheelpad", "usr/bin/", "755"],
@@ -84,41 +84,11 @@ assets = [
     { source = "README.ja.md", dest = "/usr/share/doc/letsnote-wheelpad/README.ja.md", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/doc/letsnote-wheelpad/LICENSE", mode = "644", doc = true },
 ]
-post_install_script = """
-identity_ready=0
-device_mutation_ready=0
-if command -v getent >/dev/null 2>&1; then
-    if getent passwd letsnote-wheelpad >/dev/null 2>&1 && getent group letsnote-wheelpad >/dev/null 2>&1; then
-        identity_ready=1
-    elif command -v systemd-sysusers >/dev/null 2>&1; then
-        if ! systemd-sysusers /usr/lib/sysusers.d/letsnote-wheelpad.conf; then
-            echo "letsnote-wheelpad: systemd-sysusers failed" >&2
-            exit 1
-        fi
-        if getent passwd letsnote-wheelpad >/dev/null 2>&1 && getent group letsnote-wheelpad >/dev/null 2>&1; then
-            identity_ready=1
-        else
-            echo "letsnote-wheelpad: dedicated passwd/group identity was not created" >&2
-            exit 1
-        fi
-    else
-        echo "letsnote-wheelpad: systemd-sysusers unavailable; skipping system/device mutation" >&2
-    fi
-else
-    echo "letsnote-wheelpad: getent unavailable; skipping system/device mutation" >&2
-fi
+post_install_script = "packaging/rpm/post.sh"
+pre_uninstall_script = "packaging/rpm/preun.sh"
+post_uninstall_script = "packaging/rpm/postun.sh"
 
-if [ "$identity_ready" -eq 1 ] && command -v udevadm >/dev/null 2>&1; then
-    device_mutation_ready=1
-    udevadm control --reload-rules || true
-    udevadm trigger || true
-elif [ "$identity_ready" -eq 1 ]; then
-    echo "letsnote-wheelpad: udevadm unavailable; skipping device mutation" >&2
-fi
-if [ "$device_mutation_ready" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload || true
-fi
-"""
-pre_uninstall_script = """
-true
-"""
+[package.metadata.generate-rpm.requires]
+acl = "*"
+systemd = "*"
+systemd-udev = "*"

@@ -15,21 +15,21 @@ Panasonic Let's Note の **ホイールパッド**（タッチパッド外周を
 ### Ubuntu / Debian
 
 ```sh
-sudo dpkg -i letsnote-wheelpad_0.1.0_amd64.deb
+sudo dpkg -i letsnote-wheelpad_0.2.0-1_amd64.deb
 systemctl --user enable --now letsnote-wheelpad.service
 ```
 
 ### Fedora / RHEL
 
 ```sh
-sudo rpm -i letsnote-wheelpad-0.1.0-1.x86_64.rpm
+sudo rpm -i letsnote-wheelpad-0.2.0-1.x86_64.rpm
 systemctl --user enable --now letsnote-wheelpad.service
 ```
 
 ### Arch
 
 ```sh
-yay -S letsnote-wheelpad      # AUR
+yay -S letsnote-wheelpad-bin
 systemctl --user enable --now letsnote-wheelpad.service
 ```
 
@@ -43,11 +43,13 @@ sudo install -Dm755 target/release/letsnote-wheelpad /usr/bin/letsnote-wheelpad
 sudo install -Dm644 packaging/udev/70-letsnote-wheelpad.rules /etc/udev/rules.d/70-letsnote-wheelpad.rules
 sudo install -Dm644 packaging/systemd/letsnote-wheelpad.service /etc/systemd/user/letsnote-wheelpad.service
 sudo install -Dm644 packaging/modules-load/letsnote-wheelpad.conf /etc/modules-load.d/letsnote-wheelpad.conf
-sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo udevadm control --reload-rules
 sudo modprobe uinput
 systemctl --user daemon-reload
 systemctl --user enable --now letsnote-wheelpad.service
 ```
+
+package の install だけではどちらの service mode も有効になりません。legacy mode を使う場合は、上記の user service を明示的に有効にしてください。
 
 ## system service への明示的な移行（0.2.0 preview）
 
@@ -55,8 +57,8 @@ systemctl --user enable --now letsnote-wheelpad.service
 
 ```sh
 systemctl --user disable --now letsnote-wheelpad.service
-sudo /usr/libexec/letsnote-wheelpad-migrate status
-sudo /usr/libexec/letsnote-wheelpad-migrate enable \
+pkexec /usr/libexec/letsnote-wheelpad-migrate status
+pkexec /usr/libexec/letsnote-wheelpad-migrate enable \
   --device /dev/input/eventN
 ```
 
@@ -65,12 +67,16 @@ sudo /usr/libexec/letsnote-wheelpad-migrate enable \
 従来の user service に戻す手順は次のとおりです。
 
 ```sh
-sudo /usr/libexec/letsnote-wheelpad-migrate disable \
+pkexec /usr/libexec/letsnote-wheelpad-migrate disable \
   --device /dev/input/eventN
 systemctl --user enable --now letsnote-wheelpad.service
 ```
 
-remove、purge、downgrade の処理は未実装であるため、0.2.0 はまだ production release ではありません。
+Debian、RPM、Arch package を削除する前に、system mode が有効なら無効化し、legacy user service を停止して、migration marker が残っていないことを確認してください。downgrade の前には helper で明示的に rollback し、すべての package daemon を停止してください。この準備なしの RPM または Arch の直接 downgrade は非対応です。
+
+package lifecycle script は user home を探索・変更せず、専用の `letsnote-wheelpad` system user/group は package 削除後も保持します。Arch の `letsnote-wheelpad-bin` と `letsnote-wheelpad-git` は競合する代替 package です。古い Debian 0.1.0 の `prerm` は upgrade 中に legacy service の global enable state を削除していた可能性があります。0.2.0 はそれが管理者の意図だったかを推測しないため、legacy mode を使う user は user service を明示的に有効化してください。
+
+0.2.0 は引き続き development candidate であり、production release ではありません。
 
 ## 設定
 

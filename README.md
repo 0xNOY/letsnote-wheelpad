@@ -15,21 +15,21 @@ Works on Wayland and X11 by reading evdev events directly from the physical Syna
 ### Ubuntu / Debian
 
 ```sh
-sudo dpkg -i letsnote-wheelpad_0.1.0_amd64.deb
+sudo dpkg -i letsnote-wheelpad_0.2.0-1_amd64.deb
 systemctl --user enable --now letsnote-wheelpad.service
 ```
 
 ### Fedora / RHEL
 
 ```sh
-sudo rpm -i letsnote-wheelpad-0.1.0-1.x86_64.rpm
+sudo rpm -i letsnote-wheelpad-0.2.0-1.x86_64.rpm
 systemctl --user enable --now letsnote-wheelpad.service
 ```
 
 ### Arch
 
 ```sh
-yay -S letsnote-wheelpad      # AUR
+yay -S letsnote-wheelpad-bin
 systemctl --user enable --now letsnote-wheelpad.service
 ```
 
@@ -43,11 +43,13 @@ sudo install -Dm755 target/release/letsnote-wheelpad /usr/bin/letsnote-wheelpad
 sudo install -Dm644 packaging/udev/70-letsnote-wheelpad.rules /etc/udev/rules.d/70-letsnote-wheelpad.rules
 sudo install -Dm644 packaging/systemd/letsnote-wheelpad.service /etc/systemd/user/letsnote-wheelpad.service
 sudo install -Dm644 packaging/modules-load/letsnote-wheelpad.conf /etc/modules-load.d/letsnote-wheelpad.conf
-sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo udevadm control --reload-rules
 sudo modprobe uinput
 systemctl --user daemon-reload
 systemctl --user enable --now letsnote-wheelpad.service
 ```
+
+Package installation does not enable either service mode. Enable the user service explicitly for legacy mode, as shown above.
 
 ## Explicit system-service migration (0.2.0 preview)
 
@@ -55,8 +57,8 @@ Migration is an administrator-initiated opt-in for a machine with exactly one su
 
 ```sh
 systemctl --user disable --now letsnote-wheelpad.service
-sudo /usr/libexec/letsnote-wheelpad-migrate status
-sudo /usr/libexec/letsnote-wheelpad-migrate enable \
+pkexec /usr/libexec/letsnote-wheelpad-migrate status
+pkexec /usr/libexec/letsnote-wheelpad-migrate enable \
   --device /dev/input/eventN
 ```
 
@@ -65,12 +67,16 @@ Never copy `eventN` from an old log; input event numbers can change. Migration d
 To return to the legacy user service:
 
 ```sh
-sudo /usr/libexec/letsnote-wheelpad-migrate disable \
+pkexec /usr/libexec/letsnote-wheelpad-migrate disable \
   --device /dev/input/eventN
 systemctl --user enable --now letsnote-wheelpad.service
 ```
 
-Remove, purge, and downgrade handling remain pending, so 0.2.0 is not yet a production release.
+Before removing a Debian, RPM, or Arch package, disable system mode when active, stop the legacy user service, and verify that no migration marker remains. Before a downgrade, run the helper rollback and stop every package daemon. Direct RPM or Arch downgrade without this preparation is unsupported.
+
+Package lifecycle scripts never scan or modify user home directories, and the dedicated `letsnote-wheelpad` system user and group remain after package removal. `letsnote-wheelpad-bin` and `letsnote-wheelpad-git` are conflicting alternative Arch packages. An old Debian 0.1.0 `prerm` may have removed global legacy-service enable state during upgrade; 0.2.0 does not guess whether that state reflected administrator intent, so users who want legacy mode must enable their user service explicitly.
+
+Version 0.2.0 remains a development candidate and is not yet a production release.
 
 ## Configuration
 

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       run_packages:
-        description: Build Debian and RPM packages
+        description: Build Debian, RPM, and Arch packages
         required: false
         default: false
         type: boolean
@@ -110,4 +110,58 @@ jobs:
         with:
           name: letsnote-wheelpad-rpm
           path: target/generate-rpm/*.rpm
+          if-no-files-found: error
+
+  build-arch:
+    name: build Arch package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    needs: [fmt, clippy, test, build-deb]
+    if: >-
+      (github.event_name == 'push' &&
+       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_packages == true)
+    steps:
+      - run: pacman -Syu --needed --noconfirm acl libarchive namcap python systemd util-linux
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: letsnote-wheelpad-deb
+          path: deb-artifact
+      - name: Render the CI PKGBUILD from the exact workflow Debian artifact
+        run: |
+          deb_path=$(find "$GITHUB_WORKSPACE/deb-artifact" -maxdepth 1 -type f -name '*.deb' -print)
+          test "$(printf '%s\n' "$deb_path" | grep -c .)" -eq 1
+          deb_sha=$(sha256sum "$deb_path" | awk '{print $1}')
+          mkdir -p arch-build
+          sed -e 's/@PKGVER@/0.2.0/g' \
+              -e "s/@DEB_SHA256@/$deb_sha/g" \
+              packaging/aur/PKGBUILD.in >arch-build/PKGBUILD
+          sed -i \
+              "s|https://github.com/0xNOY/letsnote-wheelpad/releases/download/v"'${pkgver}/${_deb_file}'"|file://$deb_path|" \
+              arch-build/PKGBUILD
+          cp packaging/aur/letsnote-wheelpad-bin.install arch-build/
+          cp packaging/aur/letsnote-wheelpad-bin-guard arch-build/
+          cp packaging/aur/30-letsnote-wheelpad-bin-remove.hook arch-build/
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+      - name: Build and inspect the Arch package as a non-root user
+        run: |
+          runuser -u builder -- sh -c \
+            "cd '$GITHUB_WORKSPACE/arch-build' && makepkg --printsrcinfo >.SRCINFO"
+          runuser -u builder -- sh -c \
+            "cd '$GITHUB_WORKSPACE/arch-build' && namcap PKGBUILD"
+          runuser -u builder -- sh -c \
+            "cd '$GITHUB_WORKSPACE/arch-build' && makepkg --noconfirm"
+          namcap arch-build/letsnote-wheelpad-bin-0.2.0-1-x86_64.pkg.tar.zst
+      - name: Verify Arch artifact and lifecycle
+        run: |
+          deb_path=$(find "$GITHUB_WORKSPACE/deb-artifact" -maxdepth 1 -type f -name '*.deb' -print)
+          package_path="$GITHUB_WORKSPACE/arch-build/letsnote-wheelpad-bin-0.2.0-1-x86_64.pkg.tar.zst"
+          python tests/verify_arch_package.py --arch "$package_path" --deb "$deb_path"
+          sh tests/test_arch_lifecycle.sh "$package_path"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: letsnote-wheelpad-arch
+          path: arch-build/letsnote-wheelpad-bin-0.2.0-1-x86_64.pkg.tar.zst
           if-no-files-found: error

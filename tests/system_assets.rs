@@ -339,21 +339,18 @@ fn migration_assets_are_packaged_for_debian_and_rpm() {
         "Debian and RPM must still package the current user service"
     );
 
-    assert_eq!(cargo_toml.matches("udevadm trigger || true").count(), 1);
-    assert_eq!(
-        cargo_toml
-            .matches("systemctl daemon-reload || true")
-            .count(),
-        1
-    );
+    assert!(cargo_toml.contains("depends = \"$auto, acl, systemd, udev\""));
+    assert!(cargo_toml.contains("post_install_script = \"packaging/rpm/post.sh\""));
+    assert!(cargo_toml.contains("pre_uninstall_script = \"packaging/rpm/preun.sh\""));
+    assert!(cargo_toml.contains("post_uninstall_script = \"packaging/rpm/postun.sh\""));
 }
 
 #[test]
 fn package_scripts_verify_identity_before_reloading_udev() {
     let debian = repository_file("packaging/deb/postinst");
-    let rpm_metadata = repository_file("Cargo.toml");
+    let rpm_post = repository_file("packaging/rpm/post.sh");
 
-    for script in [&debian, &rpm_metadata] {
+    for script in [&debian, &rpm_post] {
         let sysusers = script
             .find("systemd-sysusers /usr/lib/sysusers.d/letsnote-wheelpad.conf")
             .unwrap();
@@ -365,27 +362,21 @@ fn package_scripts_verify_identity_before_reloading_udev() {
             .find("getent group letsnote-wheelpad")
             .map(|offset| offset + sysusers)
             .unwrap();
-        let reload = script.find("udevadm control --reload-rules").unwrap();
+        let refresh = script
+            .rfind("targeted_udev_refresh")
+            .expect("missing targeted refresh invocation");
         assert!(sysusers < passwd_verification);
         assert!(sysusers < group_verification);
-        assert!(passwd_verification < reload);
-        assert!(group_verification < reload);
+        assert!(passwd_verification < refresh);
+        assert!(group_verification < refresh);
         assert!(!script.contains("userdel"));
         assert!(!script.contains("groupdel"));
     }
 
-    let rpm_post = rpm_metadata
-        .split_once("post_install_script = \"\"\"")
-        .unwrap()
-        .1
-        .split_once("\"\"\"")
-        .unwrap()
-        .0;
-    for script in [&debian[..], rpm_post] {
+    for script in [&debian[..], &rpm_post] {
         assert!(!script.contains("system-service-enabled"));
         assert!(!script.contains("migration-staging"));
         assert!(!script.contains("migration-block-user-service"));
-        assert!(!script.contains("letsnote-wheelpad@"));
         assert!(!script.contains("systemctl start"));
     }
 }
