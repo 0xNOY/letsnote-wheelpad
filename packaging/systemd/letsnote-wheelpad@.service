@@ -1,7 +1,8 @@
 [Unit]
 Description=Let's Note WheelPad for /dev/input/%I
 Documentation=https://github.com/0xNOY/letsnote-wheelpad
-ConditionPathExists=/etc/letsnote-wheelpad/system-service-enabled
+ConditionPathExists=|/etc/letsnote-wheelpad/system-service-enabled
+ConditionPathExists=|/run/letsnote-wheelpad/migration-staging
 BindsTo=dev-input-%i.device
 After=dev-input-%i.device systemd-udevd.service
 Before=display-manager.service

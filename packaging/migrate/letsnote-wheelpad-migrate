@@ -1,0 +1,498 @@
+#!/bin/sh
+set -eu
+umask 022
+
+program=${0##*/}
+runtime_dir=/run/letsnote-wheelpad
+staging_marker=$runtime_dir/migration-staging
+user_block_marker=$runtime_dir/migration-block-user-service
+persistent_marker=/etc/letsnote-wheelpad/system-service-enabled
+config=/etc/letsnote-wheelpad/config.toml
+daemon=/usr/bin/letsnote-wheelpad
+
+fail()
+{
+    printf '%s: %s\n' "$program" "$*" >&2
+    exit 1
+}
+
+usage()
+{
+    printf 'usage: %s status\n' "$program" >&2
+    printf '       %s enable --device /dev/input/eventN\n' "$program" >&2
+    printf '       %s disable --device /dev/input/eventN\n' "$program" >&2
+    exit 2
+}
+
+require_root()
+{
+    [ "$(id -u)" -eq 0 ] || fail "must be run as root"
+}
+
+require_tools()
+{
+    for tool in udevadm stat readlink systemctl getent flock
+    do
+        command -v "$tool" >/dev/null 2>&1 || fail "required command not found: $tool"
+    done
+}
+
+is_touchpad()
+{
+    udevadm info --query=property --path "$1" 2>/dev/null |
+        grep -q '^ID_INPUT_TOUCHPAD=1$'
+}
+
+is_supported_sysfs()
+{
+    event_sysfs=$1
+    [ -d "$event_sysfs/device" ] || return 1
+    is_touchpad "$event_sysfs" || return 1
+
+    device_dir=$event_sysfs/device
+    [ -r "$device_dir/name" ] || return 1
+    [ -r "$device_dir/id/bustype" ] || return 1
+    [ -r "$device_dir/id/vendor" ] || return 1
+    [ -r "$device_dir/id/product" ] || return 1
+    device_name=$(cat "$device_dir/name")
+    device_bus=$(cat "$device_dir/id/bustype")
+    device_vendor=$(cat "$device_dir/id/vendor")
+    device_product=$(cat "$device_dir/id/product")
+
+    if [ "$device_bus" = 0006 ]; then
+        return 1
+    fi
+    if [ "$device_vendor" = 6c6e ] &&
+        { [ "$device_product" = 7470 ] || [ "$device_product" = 7770 ]; }
+    then
+        return 1
+    fi
+
+    case "$device_name" in
+        *TM3562*) return 0 ;;
+    esac
+
+    [ "$device_bus" = 0011 ] &&
+        [ "$device_vendor" = 0002 ] &&
+        [ "$device_product" = 0007 ] &&
+        [ "$device_name" = "SynPS/2 Synaptics TouchPad" ]
+}
+
+scan_candidates()
+{
+    candidate_count=0
+    candidate_path=
+    for event_sysfs in /sys/class/input/event*
+    do
+        [ -e "$event_sysfs" ] || continue
+        if is_supported_sysfs "$event_sysfs"; then
+            candidate_count=$((candidate_count + 1))
+            candidate_path=/dev/input/${event_sysfs##*/}
+        fi
+    done
+}
+
+device_numbers()
+{
+    node_numbers=$(stat -c '%t:%T' "$1") || return 1
+    node_major_hex=${node_numbers%:*}
+    node_minor_hex=${node_numbers#*:}
+    node_major=$(printf '%d' "0x$node_major_hex") || return 1
+    node_minor=$(printf '%d' "0x$node_minor_hex") || return 1
+    printf '%s:%s\n' "$node_major" "$node_minor"
+}
+
+recheck_selected_device()
+{
+    [ -c "$selected_path" ] || fail "$selected_path is no longer a character device"
+    [ -e "$selected_sysfs" ] || fail "$selected_path no longer exists in sysfs"
+    sysfs_numbers=$(cat "$selected_sysfs/dev") || fail "cannot read $selected_sysfs/dev"
+    current_numbers=$(device_numbers "$selected_path") || fail "cannot inspect $selected_path"
+    [ "$current_numbers" = "$sysfs_numbers" ] || fail "$selected_path major/minor changed"
+    is_supported_sysfs "$selected_sysfs" || fail "$selected_path identity changed"
+    [ "$device_name" = "$selected_device_name" ] || fail "$selected_path name changed"
+    [ "$device_bus" = "$selected_device_bus" ] || fail "$selected_path bustype changed"
+    [ "$device_vendor" = "$selected_device_vendor" ] || fail "$selected_path vendor changed"
+    [ "$device_product" = "$selected_device_product" ] || fail "$selected_path product changed"
+}
+
+select_device()
+{
+    supplied=$1
+    case "$supplied" in
+        /dev/input/event*) ;;
+        *) fail "device must be exactly /dev/input/eventN" ;;
+    esac
+    event_number=${supplied#/dev/input/event}
+    case "$event_number" in
+        ''|*[!0-9]*) fail "device must be exactly /dev/input/eventN" ;;
+    esac
+    [ -c "$supplied" ] || fail "$supplied is not a character device"
+
+    scan_candidates
+    [ "$candidate_count" -ne 0 ] || fail "no supported physical touchpad found"
+    [ "$candidate_count" -eq 1 ] || fail "found $candidate_count supported physical touchpads; exactly one is required"
+    [ "$supplied" = "$candidate_path" ] || fail "$supplied is not the unique supported candidate $candidate_path"
+
+    selected_path=$supplied
+    selected_event=${selected_path##*/}
+    selected_sysfs=/sys/class/input/$selected_event
+    selected_unit=letsnote-wheelpad@$selected_event.service
+    selected_device_name=$(cat "$selected_sysfs/device/name")
+    selected_device_bus=$(cat "$selected_sysfs/device/id/bustype")
+    selected_device_vendor=$(cat "$selected_sysfs/device/id/vendor")
+    selected_device_product=$(cat "$selected_sysfs/device/id/product")
+    recheck_selected_device
+}
+
+running_daemons()
+{
+    daemon_pids=
+    for process_exe in /proc/[0-9]*/exe
+    do
+        [ -L "$process_exe" ] || continue
+        resolved=$(readlink "$process_exe" 2>/dev/null || true)
+        case "$resolved" in
+            "$daemon"|"$daemon (deleted)")
+                process_pid=${process_exe#/proc/}
+                process_pid=${process_pid%/exe}
+                if [ -n "$daemon_pids" ]; then
+                    daemon_pids="$daemon_pids $process_pid"
+                else
+                    daemon_pids=$process_pid
+                fi
+                ;;
+        esac
+    done
+    [ -z "$daemon_pids" ]
+}
+
+print_node_state()
+{
+    node=$1
+    if [ -e "$node" ]; then
+        node_state=$(stat -c '%U:%G %a' "$node")
+        printf '%s owner/group/mode: %s\n' "$node" "$node_state"
+    else
+        printf '%s owner/group/mode: absent\n' "$node"
+    fi
+}
+
+named_acl_entries()
+{
+    acl_node=$1
+    acl_output=$(getfacl -cp "$acl_node" 2>/dev/null) || return 1
+    printf '%s\n' "$acl_output" |
+        awk -F: '$1 == "user" && $2 != "" { print }'
+}
+
+print_acl_state()
+{
+    acl_node=$1
+    if ! command -v getfacl >/dev/null 2>&1; then
+        printf '%s named user ACLs: unknown (getfacl unavailable)\n' "$acl_node"
+        return
+    fi
+    if [ ! -e "$acl_node" ]; then
+        printf '%s named user ACLs: node absent\n' "$acl_node"
+        return
+    fi
+    if ! acl_entries=$(named_acl_entries "$acl_node"); then
+        printf '%s named user ACLs: unknown (getfacl failed)\n' "$acl_node"
+        return
+    fi
+    if [ -n "$acl_entries" ]; then
+        printf '%s named user ACLs: present\n' "$acl_node"
+        printf '%s\n' "$acl_entries" | while IFS= read -r acl_entry
+        do
+            printf '  %s\n' "$acl_entry"
+        done
+    else
+        printf '%s named user ACLs: absent\n' "$acl_node"
+    fi
+}
+
+print_status()
+{
+    scan_candidates
+    printf 'supported candidate count: %s\n' "$candidate_count"
+    if [ "$candidate_count" -eq 1 ]; then
+        printf 'selected event path: %s\n' "$candidate_path"
+        status_event=${candidate_path##*/}
+        status_unit=letsnote-wheelpad@$status_event.service
+    else
+        printf 'selected event path: none\n'
+        status_unit=
+    fi
+    for marker_spec in \
+        "persistent marker:$persistent_marker" \
+        "runtime staging:$staging_marker" \
+        "runtime user block:$user_block_marker"
+    do
+        marker_label=${marker_spec%%:*}
+        marker_path=${marker_spec#*:}
+        if [ -e "$marker_path" ]; then
+            printf '%s: present\n' "$marker_label"
+        else
+            printf '%s: absent\n' "$marker_label"
+        fi
+    done
+    if [ -n "$status_unit" ] && systemctl is-active --quiet "$status_unit"; then
+        printf 'expected system instance: active (%s)\n' "$status_unit"
+    elif [ -n "$status_unit" ]; then
+        printf 'expected system instance: inactive (%s)\n' "$status_unit"
+    else
+        printf 'expected system instance: inactive (no unique candidate)\n'
+    fi
+    if running_daemons; then
+        printf 'running %s processes: none\n' "$daemon"
+    else
+        printf 'running %s processes: %s\n' "$daemon" "$daemon_pids"
+    fi
+    if [ "$candidate_count" -eq 1 ]; then
+        print_node_state "$candidate_path"
+        print_acl_state "$candidate_path"
+    else
+        printf 'physical node owner/group/mode: unavailable\n'
+        printf 'physical node named user ACLs: unavailable\n'
+    fi
+    print_node_state /dev/uinput
+    print_acl_state /dev/uinput
+}
+
+acquire_lock()
+{
+    install -d -m 0755 "$runtime_dir"
+    exec 9>"$runtime_dir/migration.lock"
+    flock -x 9
+}
+
+verify_config()
+{
+    [ -e "$config" ] || fail "$config does not exist"
+    [ ! -L "$config" ] || fail "$config must not be a symlink"
+    [ -f "$config" ] || fail "$config is not a regular file"
+    config_uid=$(stat -c '%u' "$config")
+    [ "$config_uid" -eq 0 ] || fail "$config must be owned by UID 0"
+    config_access=$(stat -c '%A' "$config")
+    group_write=$(printf '%s' "$config_access" | cut -c6)
+    other_write=$(printf '%s' "$config_access" | cut -c9)
+    [ "$group_write" != w ] && [ "$other_write" != w ] ||
+        fail "$config must not be group/world writable"
+}
+
+verify_identity()
+{
+    passwd_entry=$(getent passwd letsnote-wheelpad) || fail "letsnote-wheelpad passwd entry is missing"
+    getent group letsnote-wheelpad >/dev/null 2>&1 || fail "letsnote-wheelpad group entry is missing"
+    identity_uid=$(printf '%s\n' "$passwd_entry" | cut -d: -f3)
+    case "$identity_uid" in
+        ''|*[!0-9]*) fail "letsnote-wheelpad UID is invalid" ;;
+    esac
+}
+
+reload_and_trigger()
+{
+    udevadm control --reload-rules
+    recheck_selected_device
+    udevadm trigger --action=change --subsystem-match=input --sysname-match="$selected_event"
+    recheck_selected_device
+    udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput
+    udevadm settle
+}
+
+verify_node_access()
+{
+    access_node=$1
+    [ -c "$access_node" ] || fail "$access_node is not a character device"
+    access_state=$(stat -c '%U:%G:%a' "$access_node")
+    [ "$access_state" = root:letsnote-wheelpad:660 ] ||
+        fail "$access_node has $access_state; expected root:letsnote-wheelpad:660"
+}
+
+verify_no_named_acls()
+{
+    command -v getfacl >/dev/null 2>&1 || fail "getfacl is required; staging will be rolled back"
+    for acl_node in "$selected_path" /dev/uinput
+    do
+        if ! acl_entries=$(named_acl_entries "$acl_node"); then
+            fail "getfacl failed for $acl_node; staging will be rolled back"
+        fi
+        if [ -n "$acl_entries" ]; then
+            printf '%s: named user ACL remains on %s:\n' "$program" "$acl_node" >&2
+            printf '%s\n' "$acl_entries" >&2
+            fail "remove the named user ACL outside this helper, then retry"
+        fi
+    done
+}
+
+cleanup_mode=
+staging_started=0
+staging_created=0
+user_block_created=0
+instance_started=0
+marker_created=0
+marker_tmp=
+
+cleanup_failure()
+{
+    cleanup_status=$?
+    trap - EXIT HUP INT TERM
+    [ "$cleanup_status" -ne 0 ] || exit 0
+    set +e
+    if [ "$cleanup_mode" = enable ] && [ "$staging_started" -eq 1 ]; then
+        if [ "$instance_started" -eq 1 ]; then
+            systemctl stop "$selected_unit"
+            if systemctl is-active --quiet "$selected_unit" || ! running_daemons; then
+                printf '%s: rollback could not stop %s; authorization markers retained\n' \
+                    "$program" "$selected_unit" >&2
+                exit "$cleanup_status"
+            fi
+        fi
+        if [ "$marker_created" -eq 1 ]; then
+            rm -f "$persistent_marker"
+        fi
+        if [ -n "$marker_tmp" ]; then
+            rm -f "$marker_tmp"
+        fi
+        if [ "$staging_created" -eq 1 ]; then
+            rm -f "$staging_marker"
+        fi
+        if [ "$user_block_created" -eq 1 ]; then
+            rm -f "$user_block_marker"
+        fi
+        udevadm control --reload-rules
+        if recheck_selected_device; then
+            udevadm trigger --action=change --subsystem-match=input --sysname-match="$selected_event"
+        fi
+        if recheck_selected_device; then
+            udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput
+        fi
+        udevadm settle
+    elif [ "$cleanup_mode" = enable ] && [ "$user_block_created" -eq 1 ]; then
+        rm -f "$user_block_marker"
+    fi
+    exit "$cleanup_status"
+}
+
+enable_system_service()
+{
+    acquire_lock
+    select_device "$1"
+    verify_config
+    verify_identity
+
+    persistent_present=0
+    staging_present=0
+    user_block_present=0
+    system_active=0
+    [ ! -e "$persistent_marker" ] || persistent_present=1
+    [ ! -e "$staging_marker" ] || staging_present=1
+    [ ! -e "$user_block_marker" ] || user_block_present=1
+    if systemctl is-active --quiet "$selected_unit"; then
+        system_active=1
+    fi
+
+    if [ "$persistent_present" -eq 1 ]; then
+        if [ "$system_active" -eq 1 ]; then
+            printf 'already enabled: %s is active\n' "$selected_unit"
+            return
+        fi
+        fail "persistent marker exists but $selected_unit is not active"
+    fi
+    if [ "$staging_present" -eq 1 ] ||
+        [ "$user_block_present" -eq 1 ] ||
+        [ "$system_active" -eq 1 ]
+    then
+        fail "interrupted migration state detected; recover with: letsnote-wheelpad-migrate disable --device $selected_path"
+    fi
+
+    cleanup_mode=enable
+    trap cleanup_failure EXIT
+    trap 'exit 1' HUP INT TERM
+    user_block_created=1
+    : >"$user_block_marker"
+    if ! running_daemons; then
+        printf '%s: running %s process(es): %s\n' "$program" "$daemon" "$daemon_pids" >&2
+        fail "first run: systemctl --user disable --now letsnote-wheelpad.service"
+    fi
+
+    staging_started=1
+    staging_created=1
+    : >"$staging_marker"
+    reload_and_trigger
+    verify_node_access "$selected_path"
+    verify_node_access /dev/uinput
+    verify_no_named_acls
+
+    instance_started=1
+    systemctl start "$selected_unit"
+    systemctl is-active --quiet "$selected_unit" || fail "$selected_unit did not become active"
+    main_pid=$(systemctl show --property=MainPID --value "$selected_unit")
+    case "$main_pid" in
+        ''|0|*[!0-9]*) fail "$selected_unit has no non-zero MainPID" ;;
+    esac
+    main_uid=$(stat -c '%u' "/proc/$main_pid") || fail "cannot inspect MainPID $main_pid"
+    [ "$main_uid" = "$identity_uid" ] || fail "$selected_unit MainPID runs as UID $main_uid, expected $identity_uid"
+
+    marker_tmp=$(mktemp /etc/letsnote-wheelpad/.system-service-enabled.XXXXXX)
+    chmod 0644 "$marker_tmp"
+    marker_created=1
+    mv -f "$marker_tmp" "$persistent_marker"
+    marker_tmp=
+    rm -f "$staging_marker" "$user_block_marker"
+    staging_started=0
+    cleanup_mode=
+    trap - EXIT HUP INT TERM
+    printf 'enabled: %s\n' "$selected_unit"
+}
+
+disable_system_service()
+{
+    cleanup_mode=disable
+    trap cleanup_failure EXIT
+    trap 'exit 1' HUP INT TERM
+    acquire_lock
+    select_device "$1"
+    [ -e "$user_block_marker" ] || : >"$user_block_marker"
+    systemctl stop "$selected_unit"
+    stopped_state=$(systemctl show --property=ActiveState --value "$selected_unit")
+    stopped_pid=$(systemctl show --property=MainPID --value "$selected_unit")
+    if [ "$stopped_state" != inactive ] || [ "$stopped_pid" != 0 ]; then
+        fail "$selected_unit could not be stopped; persistent marker retained"
+    fi
+    rm -f "$persistent_marker"
+    rm -f "$staging_marker"
+    reload_and_trigger
+    rm -f "$user_block_marker"
+    cleanup_mode=
+    trap - EXIT HUP INT TERM
+    printf 'disabled: %s\n' "$selected_unit"
+    print_node_state "$selected_path"
+    print_acl_state "$selected_path"
+    print_node_state /dev/uinput
+    print_acl_state /dev/uinput
+    printf 'To restore the legacy user service, run as the intended user:\n'
+    printf 'systemctl --user enable --now letsnote-wheelpad.service\n'
+}
+
+require_root
+require_tools
+
+case ${1-} in
+    status)
+        [ "$#" -eq 1 ] || usage
+        print_status
+        ;;
+    enable|disable)
+        command_name=$1
+        [ "$#" -eq 3 ] || usage
+        [ "$2" = --device ] || usage
+        if [ "$command_name" = enable ]; then
+            enable_system_service "$3"
+        else
+            disable_system_service "$3"
+        fi
+        ;;
+    *) usage ;;
+esac

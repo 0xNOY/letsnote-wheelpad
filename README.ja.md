@@ -49,6 +49,29 @@ systemctl --user daemon-reload
 systemctl --user enable --now letsnote-wheelpad.service
 ```
 
+## system service への明示的な移行（0.2.0 preview）
+
+移行は、対応する物理タッチパッドが1台だけある環境で、管理者が明示的に選択した場合にのみ実行します。package の install または upgrade だけでは移行しません。従来の user daemon を停止し、`status` が表示した event path を指定して system mode を有効にします。
+
+```sh
+systemctl --user disable --now letsnote-wheelpad.service
+sudo /usr/libexec/letsnote-wheelpad-migrate status
+sudo /usr/libexec/letsnote-wheelpad-migrate enable \
+  --device /dev/input/eventN
+```
+
+`eventN` は変わることがあるため、古い log からコピーせず、必ず `status` の表示を使ってください。移行は user config をコピーせず、ACL も削除しません。daemon が1つでも動作中の場合、または named user ACL が残っている場合は拒否します。
+
+従来の user service に戻す手順は次のとおりです。
+
+```sh
+sudo /usr/libexec/letsnote-wheelpad-migrate disable \
+  --device /dev/input/eventN
+systemctl --user enable --now letsnote-wheelpad.service
+```
+
+remove、purge、downgrade の処理は未実装であるため、0.2.0 はまだ production release ではありません。
+
 ## 設定
 
 設定ファイルは `~/.config/letsnote-wheelpad/config.toml` です。すべてのキーは省略可能で、デフォルト値は Windows の出荷時設定と一致します。

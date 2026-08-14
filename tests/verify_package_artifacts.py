@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Verify the Phase 2A-3a package payload without installing it."""
+"""Verify the Phase 2A-3b package payload without installing it."""
 
 import argparse
+import hashlib
 import io
 import struct
 import tarfile
@@ -15,9 +16,10 @@ EXPECTED_FILES = {
     "/usr/lib/systemd/user/letsnote-wheelpad.service",
     "/usr/lib/sysusers.d/letsnote-wheelpad.conf",
     "/usr/lib/udev/rules.d/70-letsnote-wheelpad.rules",
+    "/usr/lib/udev/rules.d/72-letsnote-wheelpad-system.rules",
+    "/usr/libexec/letsnote-wheelpad-migrate",
     "/usr/bin/letsnote-wheelpad",
 }
-FORBIDDEN_FILE = "/usr/lib/udev/rules.d/72-letsnote-wheelpad-system.rules"
 
 
 def normalize_path(name: str) -> str:
@@ -27,7 +29,6 @@ def normalize_path(name: str) -> str:
 def require_payload(files: set[str]) -> None:
     missing = EXPECTED_FILES - files
     assert not missing, f"missing package files: {sorted(missing)}"
-    assert FORBIDDEN_FILE not in files, f"forbidden package file: {FORBIDDEN_FILE}"
 
 
 def read_ar(path: Path) -> dict[str, bytes]:
@@ -46,14 +47,14 @@ def read_ar(path: Path) -> dict[str, bytes]:
     return members
 
 
-def read_tar_members(data: bytes) -> dict[str, bytes]:
-    members: dict[str, bytes] = {}
+def read_tar_members(data: bytes) -> dict[str, tuple[bytes, int]]:
+    members: dict[str, tuple[bytes, int]] = {}
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
         for member in archive.getmembers():
             if member.isfile():
                 extracted = archive.extractfile(member)
                 assert extracted is not None
-                members[normalize_path(member.name)] = extracted.read()
+                members[normalize_path(member.name)] = (extracted.read(), member.mode)
     return members
 
 
@@ -64,19 +65,29 @@ def verify_deb(path: Path) -> None:
     control = read_tar_members(archive[control_name])
     payload = read_tar_members(archive[data_name])
 
-    metadata = control["/control"].decode()
+    metadata = control["/control"][0].decode()
     version = next(line for line in metadata.splitlines() if line.startswith("Version: "))
     assert version.split(maxsplit=1)[1].split("-", 1)[0] == "0.2.0", version
     require_payload(set(payload))
 
-    conffiles = control["/conffiles"].decode().splitlines()
+    conffiles = control["/conffiles"][0].decode().splitlines()
     assert "/etc/letsnote-wheelpad/config.toml" in conffiles, conffiles
 
     root = Path(__file__).resolve().parent.parent
     for name in ("postinst", "prerm"):
-        packaged = control[f"/{name}"].decode().strip()
+        packaged = control[f"/{name}"][0].decode().strip()
         repository = (root / "packaging" / "deb" / name).read_text().strip()
         assert packaged == repository, f"Debian {name} changed in the artifact"
+
+    assert payload["/usr/libexec/letsnote-wheelpad-migrate"][1] == 0o755
+    for packaged_path, repository_path in {
+        "/usr/lib/udev/rules.d/70-letsnote-wheelpad.rules": "packaging/udev/70-letsnote-wheelpad.rules",
+        "/usr/lib/udev/rules.d/72-letsnote-wheelpad-system.rules": "packaging/udev/72-letsnote-wheelpad-system.rules",
+        "/usr/lib/systemd/user/letsnote-wheelpad.service": "packaging/systemd/letsnote-wheelpad.service",
+        "/usr/lib/systemd/system/letsnote-wheelpad@.service": "packaging/systemd/letsnote-wheelpad@.service",
+        "/usr/libexec/letsnote-wheelpad-migrate": "packaging/migrate/letsnote-wheelpad-migrate",
+    }.items():
+        assert payload[packaged_path][0] == (root / repository_path).read_bytes()
 
     print(f"verified Debian artifact: {path}")
 
@@ -93,7 +104,11 @@ def read_rpm_header(data: bytes, offset: int) -> tuple[dict[int, object], int]:
         tag, value_type, value_offset, value_count = struct.unpack_from(
             ">IIII", data, indexes + index * 16
         )
-        if value_type == 4:
+        if value_type == 3:
+            values[tag] = list(
+                struct.unpack_from(f">{value_count}H", store, value_offset)
+            )
+        elif value_type == 4:
             values[tag] = list(
                 struct.unpack_from(f">{value_count}I", store, value_offset)
             )
@@ -116,17 +131,19 @@ def read_rpm_header(data: bytes, offset: int) -> tuple[dict[int, object], int]:
     return values, store_offset + store_size
 
 
-def rpm_files(header: dict[int, object]) -> tuple[list[str], list[int]]:
+def rpm_files(header: dict[int, object]) -> tuple[list[str], list[int], list[int]]:
     basenames = header[1117]
     dir_indexes = header[1116]
     dirnames = header[1118]
     flags = header[1037]
+    modes = header[1030]
     assert isinstance(basenames, list)
     assert isinstance(dir_indexes, list)
     assert isinstance(dirnames, list)
     assert isinstance(flags, list)
+    assert isinstance(modes, list)
     files = [normalize_path(dirnames[index] + name) for name, index in zip(basenames, dir_indexes)]
-    return files, flags
+    return files, flags, modes
 
 
 def verify_rpm(path: Path) -> None:
@@ -137,21 +154,51 @@ def verify_rpm(path: Path) -> None:
     header, _ = read_rpm_header(data, header_offset)
 
     assert header[1001] == "0.2.0", f"unexpected RPM version: {header[1001]}"
-    files, flags = rpm_files(header)
+    files, flags, modes = rpm_files(header)
     require_payload(set(files))
 
     config_path = "/etc/letsnote-wheelpad/config.toml"
     config_flags = flags[files.index(config_path)]
     assert config_flags & 1, "RPM system config is not marked config"
     assert config_flags & 16, "RPM system config is not marked noreplace"
+    helper_path = "/usr/libexec/letsnote-wheelpad-migrate"
+    assert modes[files.index(helper_path)] & 0o7777 == 0o755
 
-    expected_post = """udevadm control --reload-rules || true
-udevadm trigger || true
-systemctl daemon-reload || true"""
-    assert str(header[1024]).strip() == expected_post, "RPM %post changed"
+    root = Path(__file__).resolve().parent.parent
+    cargo_toml = (root / "Cargo.toml").read_text()
+    expected_post = cargo_toml.split('post_install_script = """', 1)[1].split(
+        '"""', 1
+    )[0]
+    assert str(header[1024]).strip() == expected_post.strip(), "RPM %post changed"
     assert str(header[1025]).strip() == "true", "RPM %preun changed"
     assert 1023 not in header, "unexpected RPM %pre"
     assert 1026 not in header, "unexpected RPM %postun"
+
+    for required in (
+        "/usr/lib/udev/rules.d/70-letsnote-wheelpad.rules",
+        "/usr/lib/udev/rules.d/72-letsnote-wheelpad-system.rules",
+        "/usr/lib/systemd/user/letsnote-wheelpad.service",
+        "/usr/lib/systemd/system/letsnote-wheelpad@.service",
+        helper_path,
+    ):
+        assert required in files
+
+    digests = header[1035]
+    digest_algorithm = header.get(5011, [1])[0]
+    algorithms = {1: "md5", 8: "sha256"}
+    assert digest_algorithm in algorithms, f"unsupported RPM digest: {digest_algorithm}"
+    assert isinstance(digests, list)
+    for packaged_path, repository_path in {
+        "/usr/lib/udev/rules.d/70-letsnote-wheelpad.rules": "packaging/udev/70-letsnote-wheelpad.rules",
+        "/usr/lib/udev/rules.d/72-letsnote-wheelpad-system.rules": "packaging/udev/72-letsnote-wheelpad-system.rules",
+        "/usr/lib/systemd/user/letsnote-wheelpad.service": "packaging/systemd/letsnote-wheelpad.service",
+        "/usr/lib/systemd/system/letsnote-wheelpad@.service": "packaging/systemd/letsnote-wheelpad@.service",
+        helper_path: "packaging/migrate/letsnote-wheelpad-migrate",
+    }.items():
+        expected = hashlib.new(
+            algorithms[digest_algorithm], (root / repository_path).read_bytes()
+        ).hexdigest()
+        assert digests[files.index(packaged_path)] == expected
 
     print(f"verified RPM artifact: {path}")
 
