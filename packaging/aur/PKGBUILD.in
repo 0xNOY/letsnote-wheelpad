@@ -9,7 +9,7 @@ license=('MIT')
 
 depends=(
   'glibc'
-  'gcc-libs'
+  'libgcc'
   'bash'
   'systemd'
   'acl'

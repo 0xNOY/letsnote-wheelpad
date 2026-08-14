@@ -173,6 +173,8 @@ fn arch_binary_template_has_the_release_boundary() {
     assert!(!pkgbuild.contains("'SKIP'"));
     assert!(!pkgbuild.contains("cargo build"));
     assert!(!pkgbuild.contains("makedepends=('cargo"));
+    assert!(pkgbuild.contains("'libgcc'"));
+    assert!(!pkgbuild.contains("'gcc-libs'"));
 
     let hook = repository_file("packaging/aur/30-letsnote-wheelpad-bin-remove.hook");
     assert!(hook.contains("Operation = Remove"));

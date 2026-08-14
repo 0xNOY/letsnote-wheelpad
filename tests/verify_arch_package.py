@@ -98,7 +98,8 @@ def main() -> None:
     assert not metadata_values(metadata, "replaces")
     assert "etc/letsnote-wheelpad/config.toml" in metadata_values(metadata, "backup")
     dependencies = set(metadata_values(metadata, "depend"))
-    assert {"glibc", "gcc-libs", "bash", "systemd", "acl", "util-linux"} <= dependencies
+    assert {"glibc", "libgcc", "bash", "systemd", "acl", "util-linux"} <= dependencies
+    assert "gcc-libs" not in dependencies
     assert not {"rust", "cargo", "git"} & dependencies
 
     root = Path(__file__).resolve().parent.parent
