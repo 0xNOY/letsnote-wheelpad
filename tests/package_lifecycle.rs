@@ -185,7 +185,7 @@ fn arch_binary_template_has_the_release_boundary() {
 #[test]
 fn package_version_and_legacy_assets_remain() {
     let cargo = repository_file("Cargo.toml");
-    assert!(cargo.contains("version = \"0.2.0\""));
+    assert!(cargo.contains("version = \"0.2.1\""));
     for asset in [
         "packaging/udev/70-letsnote-wheelpad.rules",
         "packaging/udev/72-letsnote-wheelpad-system.rules",

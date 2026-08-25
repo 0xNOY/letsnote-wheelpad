@@ -90,9 +90,9 @@ def main() -> None:
 
     metadata = archive_bytes(args.arch, ".PKGINFO").decode()
     assert metadata_values(metadata, "pkgname") == ["letsnote-wheelpad-bin"]
-    assert metadata_values(metadata, "pkgver") == ["0.2.0-1"]
+    assert metadata_values(metadata, "pkgver") == ["0.2.1-1"]
     assert metadata_values(metadata, "arch") == ["x86_64"]
-    assert "letsnote-wheelpad=0.2.0" in metadata_values(metadata, "provides")
+    assert "letsnote-wheelpad=0.2.1" in metadata_values(metadata, "provides")
     conflicts = set(metadata_values(metadata, "conflict"))
     assert {"letsnote-wheelpad", "letsnote-wheelpad-git"} <= conflicts
     assert not metadata_values(metadata, "replaces")
