@@ -8,7 +8,7 @@ marker=$marker_dir/migration-staging
 test_dir=$(mktemp -d)
 trap 'rm -r "$test_dir"' EXIT HUP INT TERM
 
-grep -q 'Direct RPM or Arch downgrade without this preparation is unsupported' \
+grep -q 'Direct unprepared Arch or RPM downgrades are unsupported.' \
     "$repository_root/README.md"
 
 bsdtar -xOf "$package_path" .INSTALL >"$test_dir/letsnote-wheelpad-bin.install"
@@ -20,7 +20,7 @@ if failure_output=$(
     PATH="$test_dir/bin:/usr/bin:/bin"
     export PATH
     . "$test_dir/letsnote-wheelpad-bin.install"
-    post_install 0.2.0-1 2>&1
+    post_install 0.2.1-1 2>&1
 ); then
     echo 'Arch post_install unexpectedly ignored systemd-sysusers failure' >&2
     exit 1

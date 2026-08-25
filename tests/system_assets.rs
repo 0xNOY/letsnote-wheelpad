@@ -430,6 +430,27 @@ fn migration_helper_has_narrow_mutation_surface() {
 }
 
 #[test]
+fn migration_helper_auto_selects_only_one_supported_device() {
+    let helper = repository_file("packaging/migrate/letsnote-wheelpad-migrate");
+
+    assert!(helper.contains("enable [--device /dev/input/eventN]"));
+    assert!(helper.contains("disable [--device /dev/input/eventN]"));
+    assert!(helper.contains("supplied=${1-}"));
+    assert!(helper.contains(
+        "if [ -z \"$supplied\" ]; then\n        scan_candidates\n        [ \"$candidate_count\" -ne 0 ]"
+    ));
+    assert!(helper.contains(
+        "[ \"$candidate_count\" -eq 1 ] ||\n            fail \"found $candidate_count supported physical touchpads; exactly one is required\""
+    ));
+    assert!(helper.contains("printf 'auto-selected device: %s\\n' \"$supplied\""));
+    assert!(helper.contains("1) device_argument= ;;"));
+    assert!(helper.contains("[ \"$2\" = --device ] || usage"));
+    assert!(helper.contains("[ -n \"$3\" ] || usage"));
+    assert!(helper.contains("enable_system_service \"$device_argument\""));
+    assert!(helper.contains("disable_system_service \"$device_argument\""));
+}
+
+#[test]
 fn migration_helper_matches_only_package_daemon_executables() {
     let helper = repository_file("packaging/migrate/letsnote-wheelpad-migrate");
     let running_daemons = helper

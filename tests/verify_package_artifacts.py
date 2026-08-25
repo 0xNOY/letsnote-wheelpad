@@ -67,7 +67,7 @@ def verify_deb(path: Path) -> None:
 
     metadata = control["/control"][0].decode()
     version = next(line for line in metadata.splitlines() if line.startswith("Version: "))
-    assert version.split(maxsplit=1)[1].split("-", 1)[0] == "0.2.0", version
+    assert version.split(maxsplit=1)[1].split("-", 1)[0] == "0.2.1", version
     dependencies = next(
         line for line in metadata.splitlines() if line.startswith("Depends: ")
     )
@@ -158,7 +158,7 @@ def verify_rpm(path: Path) -> None:
     header_offset = signature_end + (-signature_end % 8)
     header, _ = read_rpm_header(data, header_offset)
 
-    assert header[1001] == "0.2.0", f"unexpected RPM version: {header[1001]}"
+    assert header[1001] == "0.2.1", f"unexpected RPM version: {header[1001]}"
     files, flags, modes = rpm_files(header)
     require_payload(set(files))
 
