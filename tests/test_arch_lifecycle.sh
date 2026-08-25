@@ -8,7 +8,7 @@ marker=$marker_dir/migration-staging
 test_dir=$(mktemp -d)
 trap 'rm -r "$test_dir"' EXIT HUP INT TERM
 
-grep -q 'Direct RPM or Arch downgrade without this preparation is unsupported' \
+grep -q 'Direct unprepared Arch or RPM downgrades are unsupported.' \
     "$repository_root/README.md"
 
 bsdtar -xOf "$package_path" .INSTALL >"$test_dir/letsnote-wheelpad-bin.install"
