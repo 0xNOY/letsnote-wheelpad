@@ -20,7 +20,7 @@ yay -S letsnote-wheelpad-bin
 
 ### Debian / Ubuntu
 
-[v0.2.0 Release](https://github.com/0xNOY/letsnote-wheelpad/releases/tag/v0.2.0) から `.deb` をダウンロードし、APT でインストールします。
+[最新 Release](https://github.com/0xNOY/letsnote-wheelpad/releases/latest) から `.deb` をダウンロードし、APT でインストールします。
 
 ```sh
 sudo apt install ./letsnote-wheelpad_*_amd64.deb
@@ -28,7 +28,7 @@ sudo apt install ./letsnote-wheelpad_*_amd64.deb
 
 ### Fedora / RPM 系
 
-[v0.2.0 Release](https://github.com/0xNOY/letsnote-wheelpad/releases/tag/v0.2.0) から `.rpm` をダウンロードし、DNF でインストールします。
+[最新 Release](https://github.com/0xNOY/letsnote-wheelpad/releases/latest) から `.rpm` をダウンロードし、DNF でインストールします。
 
 ```sh
 sudo dnf install ./letsnote-wheelpad-*.x86_64.rpm
@@ -38,21 +38,35 @@ sudo dnf install ./letsnote-wheelpad-*.x86_64.rpm
 
 システムモードでは専用の `letsnote-wheelpad` ユーザーでデーモンを実行します。ログインユーザーに raw evdev や `/dev/uinput` への直接アクセス権を与えず、再起動後も自動的に動作します。
 
-まず対応デバイスを確認します。従来のユーザーサービスが動作している場合は、システムモードの有効化前に停止します。
+### 1. 従来のユーザーモードを使用中なら停止する
 
 ```sh
-pkexec /usr/libexec/letsnote-wheelpad-migrate status
 systemctl --user disable --now letsnote-wheelpad.service
-pkexec /usr/libexec/letsnote-wheelpad-migrate enable \
-  --device /dev/input/eventN
 ```
 
-`status` が表示した `/dev/input/eventN` を使ってください。イベント番号は再起動などで変わります。v0.2.0 の移行機能は、対応する物理タッチパッドがちょうど 1 台ある環境を前提とします。`status` または `enable` がログインユーザーの名前付き ACL を報告した場合は、表示された正確なノードから、そのユーザーの ACL entry だけを削除して再実行します。
+従来のユーザーサービスを有効にしたことがなければ、この手順は不要です。
+
+### 2. システムモードを有効にする
+
+```sh
+sudo /usr/libexec/letsnote-wheelpad-migrate enable
+```
+
+helper は対応する物理タッチパッドがちょうど 1 台ある場合だけ自動選択し、それ以外はシステムモードを有効にせず停止します。`--device /dev/input/eventN` による明示指定も利用できますが、イベント番号は再起動などで変わるため、必ず `status` が現在表示するパスを使ってください。
+
+`enable` がログインユーザーの名前付き ACL を報告した場合は、正確なノードを確認します。
+
+```sh
+sudo /usr/libexec/letsnote-wheelpad-migrate status
+```
+
+表示されたタッチパッドと `/dev/uinput` からログインユーザーの entry だけを削除し、`enable` を再実行します。
 
 ```sh
 uid="$(id -u)"
-pkexec /usr/bin/setfacl -x "u:${uid}" /dev/input/eventN
-pkexec /usr/bin/setfacl -x "u:${uid}" /dev/uinput
+sudo /usr/bin/setfacl -x "u:${uid}" /dev/input/eventN
+sudo /usr/bin/setfacl -x "u:${uid}" /dev/uinput
+sudo /usr/libexec/letsnote-wheelpad-migrate enable
 ```
 
 `setfacl --remove-all` は使用しないでください。移行 helper は名前付き ACL を自動削除しません。
@@ -87,7 +101,7 @@ minimum_rotation_radius = 500.0
 システムモードでは次を使います。
 
 ```sh
-pkexec /usr/libexec/letsnote-wheelpad-migrate status
+sudo /usr/libexec/letsnote-wheelpad-migrate status
 journalctl -u 'letsnote-wheelpad@*.service' -f
 ```
 
@@ -99,13 +113,10 @@ journalctl --user -u letsnote-wheelpad.service -f
 
 ## 無効化とアンインストール
 
-パッケージを削除する前に、`status` が現在表示するイベントを使ってシステムモードを無効にします。
+パッケージを削除する前に、システムモードを無効にします。
 
 ```sh
-pkexec /usr/libexec/letsnote-wheelpad-migrate status
-
-pkexec /usr/libexec/letsnote-wheelpad-migrate disable \
-  --device /dev/input/eventN
+sudo /usr/libexec/letsnote-wheelpad-migrate disable
 ```
 
 従来のサービスが有効なら、そちらも停止してください。Arch は移行状態またはデーモンが残っている間、パッケージの削除を意図的に拒否します。
@@ -148,7 +159,7 @@ v0.2.0 の最終検証環境は次のとおりです。
 - `SynPS/2 Synaptics TouchPad` (`0011/0002/0007`)
 - Wayland / Hyprland
 
-他の Let's Note では、タッチパッド名や座標の調整が必要な場合があります。これは互換性を保証するものではありません。v0.2.0 のシステムモード移行は、対応する物理タッチパッドがちょうど 1 台ある環境を前提とします。システムモードは再起動を含めて実機検証済みです。
+他の Let's Note では、タッチパッド名や座標の調整が必要な場合があります。これは互換性を保証するものではありません。システムモード移行は、対応する物理タッチパッドがちょうど 1 台ある環境を前提とします。システムモードは再起動を含めて実機検証済みです。
 
 慣性・コースティングスクロールはありません。Wayland では compositor が入力先を決めるため、`WheelUnderCursor` を X11 と同じ方法で上書きすることもできません。
 

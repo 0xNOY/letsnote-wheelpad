@@ -20,7 +20,7 @@ yay -S letsnote-wheelpad-bin
 
 ### Debian / Ubuntu
 
-Download the `.deb` from the [v0.2.0 release](https://github.com/0xNOY/letsnote-wheelpad/releases/tag/v0.2.0), then install it with APT:
+Download the `.deb` from the [latest release](https://github.com/0xNOY/letsnote-wheelpad/releases/latest), then install it with APT:
 
 ```sh
 sudo apt install ./letsnote-wheelpad_*_amd64.deb
@@ -28,7 +28,7 @@ sudo apt install ./letsnote-wheelpad_*_amd64.deb
 
 ### Fedora / RPM-based distributions
 
-Download the `.rpm` from the [v0.2.0 release](https://github.com/0xNOY/letsnote-wheelpad/releases/tag/v0.2.0), then install it with DNF:
+Download the `.rpm` from the [latest release](https://github.com/0xNOY/letsnote-wheelpad/releases/latest), then install it with DNF:
 
 ```sh
 sudo dnf install ./letsnote-wheelpad-*.x86_64.rpm
@@ -38,21 +38,35 @@ sudo dnf install ./letsnote-wheelpad-*.x86_64.rpm
 
 System mode runs the daemon as the dedicated `letsnote-wheelpad` user, does not give the login user direct access to raw evdev or `/dev/uinput`, and starts again after reboot.
 
-First inspect the supported device. If the legacy user service is running, stop it before enabling system mode:
+### 1. Stop legacy mode if it is enabled
 
 ```sh
-pkexec /usr/libexec/letsnote-wheelpad-migrate status
 systemctl --user disable --now letsnote-wheelpad.service
-pkexec /usr/libexec/letsnote-wheelpad-migrate enable \
-  --device /dev/input/eventN
 ```
 
-Use the `/dev/input/eventN` reported by `status`; event numbers can change across boots. Version 0.2.0 migration expects exactly one matching physical touchpad. If `status` or `enable` reports a named ACL for your login user, remove only that user's entry from the exact reported nodes and retry:
+Skip this step if you have never enabled the legacy user service.
+
+### 2. Enable system mode
+
+```sh
+sudo /usr/libexec/letsnote-wheelpad-migrate enable
+```
+
+The helper proceeds only when it finds exactly one supported physical touchpad; otherwise it stops without enabling system mode. The explicit `--device /dev/input/eventN` form remains available, but always use the current path reported by `status` because event numbers can change across boots.
+
+If `enable` reports a named ACL for your login user, inspect the exact nodes:
+
+```sh
+sudo /usr/libexec/letsnote-wheelpad-migrate status
+```
+
+Remove only your login user's entry from the reported touchpad and `/dev/uinput`, then retry `enable`:
 
 ```sh
 uid="$(id -u)"
-pkexec /usr/bin/setfacl -x "u:${uid}" /dev/input/eventN
-pkexec /usr/bin/setfacl -x "u:${uid}" /dev/uinput
+sudo /usr/bin/setfacl -x "u:${uid}" /dev/input/eventN
+sudo /usr/bin/setfacl -x "u:${uid}" /dev/uinput
+sudo /usr/libexec/letsnote-wheelpad-migrate enable
 ```
 
 Do not use `setfacl --remove-all`. The migration helper deliberately does not delete named ACLs automatically.
@@ -87,7 +101,7 @@ minimum_rotation_radius = 500.0
 For system mode, use:
 
 ```sh
-pkexec /usr/libexec/letsnote-wheelpad-migrate status
+sudo /usr/libexec/letsnote-wheelpad-migrate status
 journalctl -u 'letsnote-wheelpad@*.service' -f
 ```
 
@@ -99,13 +113,10 @@ journalctl --user -u letsnote-wheelpad.service -f
 
 ## Disable and uninstall
 
-Before removing the package, use the current event reported by `status` to disable system mode:
+Before removing the package, disable system mode:
 
 ```sh
-pkexec /usr/libexec/letsnote-wheelpad-migrate status
-
-pkexec /usr/libexec/letsnote-wheelpad-migrate disable \
-  --device /dev/input/eventN
+sudo /usr/libexec/letsnote-wheelpad-migrate disable
 ```
 
 Also stop the legacy service if it is enabled. Arch intentionally blocks package removal while migration state or a daemon remains active.
@@ -148,7 +159,7 @@ Final v0.2.0 acceptance passed on:
 - `SynPS/2 Synaptics TouchPad` (`0011/0002/0007`)
 - Wayland / Hyprland
 
-Other Let's Note models may require touchpad-name and coordinate calibration; this is not a compatibility guarantee. Version 0.2.0 system migration requires exactly one supported physical touchpad. System mode has been tested across reboot.
+Other Let's Note models may require touchpad-name and coordinate calibration; this is not a compatibility guarantee. System migration requires exactly one supported physical touchpad. System mode has been tested across reboot.
 
 There is no kinetic or coasting scroll. On Wayland, compositor routing also means `WheelUnderCursor` cannot be overridden in the same way as on X11.
 
