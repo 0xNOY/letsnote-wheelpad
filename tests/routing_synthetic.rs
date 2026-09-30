@@ -101,6 +101,73 @@ fn start_and_engage(harness: &mut Harness) {
 }
 
 #[test]
+fn engagement_candidate_freezes_cursor_before_scroll_threshold() {
+    let mut harness = Harness::new(empty_snapshot());
+    harness.process(
+        snapshot_a(0.0),
+        frame(vec![
+            key(Key::BTN_TOUCH, 1),
+            abs(AbsoluteAxisType::ABS_MT_SLOT, CONTACT_A.slot as i32),
+            abs(AbsoluteAxisType::ABS_MT_TRACKING_ID, CONTACT_A.tracking_id),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_X, 800),
+            abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 500),
+        ]),
+        false,
+    );
+    assert!(harness.routed.iter().any(|event| {
+        event.code() == AbsoluteAxisType::ABS_MT_POSITION_X.0 && event.value() == 800
+    }));
+
+    for angle in [PI / 24.0, PI / 16.0, PI / 8.0] {
+        let contacts = snapshot_a(angle);
+        let x = 500 + (300.0 * angle.cos()).round() as i32;
+        let y = 500 + (300.0 * angle.sin()).round() as i32;
+        harness.process(
+            contacts,
+            frame(vec![
+                abs(AbsoluteAxisType::ABS_X, x),
+                abs(AbsoluteAxisType::ABS_Y, y),
+                abs(AbsoluteAxisType::ABS_MT_POSITION_X, x),
+                abs(AbsoluteAxisType::ABS_MT_POSITION_Y, y),
+            ]),
+            false,
+        );
+        assert!(harness.routed.is_empty());
+        assert_eq!(harness.processor.is_scrolling(), angle == PI / 8.0);
+    }
+}
+
+#[test]
+fn engagement_candidate_resumes_pointer_motion_inside_dead_zone() {
+    let mut harness = Harness::new(empty_snapshot());
+    harness.process(snapshot_a(0.0), frame(Vec::new()), false);
+    let mut slots = [(-1, 0, 0); SLOT_COUNT];
+    slots[CONTACT_A.slot] = (CONTACT_A.tracking_id, 500, 500);
+    let events = vec![
+        abs(AbsoluteAxisType::ABS_X, 500),
+        abs(AbsoluteAxisType::ABS_Y, 500),
+        abs(AbsoluteAxisType::ABS_MT_POSITION_X, 500),
+        abs(AbsoluteAxisType::ABS_MT_POSITION_Y, 500),
+    ];
+    harness.process(
+        ContactSnapshot::from_slot_values(&slots, Some(CONTACT_A.slot), true).unwrap(),
+        frame(events.clone()),
+        false,
+    );
+    assert!(matches!(
+        harness.processor.state(),
+        FsmState::Contact { .. }
+    ));
+    let semantics = |events: &[InputEvent]| {
+        events
+            .iter()
+            .map(|event| (event.event_type(), event.code(), event.value()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(semantics(&harness.routed), semantics(&events));
+}
+
+#[test]
 fn production_processor_suppresses_engagement_position() {
     let mut harness = Harness::new(empty_snapshot());
     start_and_engage(&mut harness);

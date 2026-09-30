@@ -45,7 +45,13 @@ impl FrameProcessor {
         let current = self.fsm.state();
         let capture = if matches!(previous, FsmState::Scrolling { .. }) {
             tracked_before
-        } else if matches!(current, FsmState::Scrolling { .. }) {
+        } else if matches!(current, FsmState::Scrolling { .. })
+            || (matches!(previous, FsmState::Moving { .. })
+                && matches!(current, FsmState::Moving { .. }))
+        {
+            // Keep the touchdown position as the virtual contact's origin,
+            // then freeze motion while waiting for the engagement angle.
+            // Otherwise the pre-scroll arc moves the cursor before capture.
             self.fsm.contact_id()
         } else {
             None
