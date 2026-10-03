@@ -1,6 +1,6 @@
 [package]
 name = "letsnote-wheelpad"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.85"
 description = "Userland daemon that ports Panasonic Let's Note WheelPad (circular touchpad scroll) to Linux"
@@ -13,7 +13,7 @@ categories = ["hardware-support", "command-line-utilities"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 evdev = "=0.12.2"
-nix = { version = "0.27", features = ["ioctl", "fs", "signal", "poll"] }
+nix = { version = "0.27", features = ["ioctl", "fs", "signal", "poll", "time"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"

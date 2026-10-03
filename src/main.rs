@@ -15,10 +15,10 @@ use letsnote_wheelpad::evdev::{
 };
 use letsnote_wheelpad::fsm::Action;
 use letsnote_wheelpad::proxy::FrameProcessor;
-use letsnote_wheelpad::runtime::{InstanceLock, LoopExit, ShutdownSignal};
+use letsnote_wheelpad::runtime::{InstanceLock, LoopExit, ResumeMonitor, ShutdownSignal};
 use letsnote_wheelpad::uinput::{UinputTouchpad, UinputWheel};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "letsnote-wheelpad",
     version,
@@ -41,9 +41,17 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    if let Err(e) = run(args) {
-        eprintln!("letsnote-wheelpad: {e}");
-        std::process::exit(1);
+    loop {
+        match run(args.clone()) {
+            Err(Error::Runtime {
+                source: LoopExit::Resumed,
+            }) => continue,
+            Err(e) => {
+                eprintln!("letsnote-wheelpad: {e}");
+                std::process::exit(1);
+            }
+            Ok(()) => break,
+        }
     }
 }
 
@@ -277,6 +285,10 @@ fn run_event_loop(
 ) -> LoopExit {
     let raw_fd = input.device.as_raw_fd();
     let mut routed_events = Vec::new();
+    let mut resume = match ResumeMonitor::new() {
+        Ok(monitor) => monitor,
+        Err(source) => return LoopExit::ClockReadFailed { source },
+    };
     loop {
         let (input_revents, signal_revents) = {
             // SAFETY: raw_fd is owned by `input.device` which outlives
@@ -287,9 +299,19 @@ fn run_event_loop(
                 PollFd::new(&borrowed, PollFlags::POLLIN),
                 PollFd::new(&signal_fd, PollFlags::POLLIN),
             ];
-            let timeout_ms = if processor.is_scrolling() { 1_000 } else { -1 };
-            match poll(&mut fds, timeout_ms) {
+            let result = poll(&mut fds, 1_000);
+            // Check before consuming queued input or synthesizing a frame:
+            // both physical and virtual contact states may predate suspend.
+            match resume.resumed() {
+                Ok(true) => return LoopExit::Resumed,
+                Ok(false) => {}
+                Err(source) => return LoopExit::ClockReadFailed { source },
+            }
+            match result {
                 Ok(0) => {
+                    if !processor.is_scrolling() {
+                        continue;
+                    }
                     let frame = match input.reconcile_liveness_frame() {
                         Ok(frame) => frame,
                         Err(source) => return LoopExit::InputReadFailed { source },

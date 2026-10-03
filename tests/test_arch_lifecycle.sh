@@ -20,7 +20,7 @@ if failure_output=$(
     PATH="$test_dir/bin:/usr/bin:/bin"
     export PATH
     . "$test_dir/letsnote-wheelpad-bin.install"
-    post_install 0.2.2-1 2>&1
+    post_install 0.2.3-1 2>&1
 ); then
     echo 'Arch post_install unexpectedly ignored systemd-sysusers failure' >&2
     exit 1
