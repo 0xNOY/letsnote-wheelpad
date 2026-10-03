@@ -12,6 +12,44 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 
 use crate::error::{Error, Result};
 
+/// BOOTTIME includes suspend; MONOTONIC excludes it. Comparing their
+/// difference distinguishes resume from an idle pad or a delayed process.
+pub struct ResumeMonitor {
+    suspend_offset_ns: i128,
+}
+
+impl ResumeMonitor {
+    pub fn new() -> nix::Result<Self> {
+        Ok(Self {
+            suspend_offset_ns: Self::offset_ns()?,
+        })
+    }
+
+    pub fn resumed(&mut self) -> nix::Result<bool> {
+        Ok(self.observe(Self::offset_ns()?))
+    }
+
+    fn offset_ns() -> nix::Result<i128> {
+        use nix::time::{clock_gettime, ClockId};
+        let monotonic = clock_gettime(ClockId::CLOCK_MONOTONIC)?;
+        let boot = clock_gettime(ClockId::CLOCK_BOOTTIME)?;
+        Ok(
+            (boot.tv_sec() as i128 - monotonic.tv_sec() as i128) * 1_000_000_000
+                + boot.tv_nsec() as i128
+                - monotonic.tv_nsec() as i128,
+        )
+    }
+
+    fn observe(&mut self, offset_ns: i128) -> bool {
+        // Allow clock-read scheduling jitter, but accumulate short sleeps.
+        if offset_ns - self.suspend_offset_ns < 100_000_000 {
+            return false;
+        }
+        self.suspend_offset_ns = offset_ns;
+        true
+    }
+}
+
 #[derive(Debug)]
 pub struct ShutdownSignal {
     fd: SignalFd,
@@ -218,6 +256,15 @@ pub enum LoopExit {
     #[error("shutdown requested")]
     RequestedShutdown,
 
+    #[error("system resumed; reinitializing input devices")]
+    Resumed,
+
+    #[error("resume clock read failed: {source}")]
+    ClockReadFailed {
+        #[source]
+        source: nix::errno::Errno,
+    },
+
     #[error("physical input device disconnected: {source}")]
     InputDisconnected {
         #[source]
@@ -270,6 +317,27 @@ mod tests {
     use nix::poll::{poll, PollFd, PollFlags};
 
     use super::*;
+
+    #[test]
+    fn resume_monitor_detects_suspend_without_treating_idle_as_resume() {
+        let mut monitor = ResumeMonitor {
+            suspend_offset_ns: 5_000_000_000,
+        };
+        // Even hours of awake idle time leave the clock offset unchanged.
+        assert!(!monitor.observe(5_000_000_000));
+        assert!(!monitor.observe(5_000_001_000));
+        assert!(!monitor.observe(4_999_999_000));
+        assert!(monitor.observe(65_000_000_000));
+        assert!(!monitor.observe(65_000_000_000));
+        assert!(monitor.observe(66_000_000_000));
+    }
+
+    #[test]
+    fn resume_monitor_reads_linux_clocks() {
+        let mut monitor = ResumeMonitor::new().unwrap();
+        assert!(!monitor.resumed().unwrap());
+        assert!(!LoopExit::Resumed.is_success());
+    }
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

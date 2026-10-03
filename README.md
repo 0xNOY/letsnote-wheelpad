@@ -167,7 +167,7 @@ There is no kinetic or coasting scroll. On Wayland, compositor routing also mean
 
 The daemon reads the physical evdev device and proxies ordinary touchpad input through a virtual touchpad. A circular gesture emits wheel events through a second virtual device while normal pointer, contact, and button behavior is preserved. Fatal errors and normal shutdown release the physical grab so ordinary input can recover.
 
-The implementation and regression tests contain the detailed input-proxy and recovery semantics.
+After suspend, the daemon reopens the physical pad and recreates the virtual devices to reset input state. The implementation and regression tests contain the detailed input-proxy and recovery semantics.
 
 ## Development build
 
